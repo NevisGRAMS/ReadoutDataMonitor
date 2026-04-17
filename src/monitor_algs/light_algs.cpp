@@ -4,6 +4,7 @@
 
 #include "light_algs.h"
 #include <cmath>
+#include <asio/detail/event.hpp>
 
 
 //bool LightAlgs::ProcessEvent(EventStruct &event) {
@@ -77,6 +78,18 @@ void LightAlgs::UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &m
     lbw_metrics.setLightAvgNumRois(avg_rois_int);
 }
 
+uint32_t LightAlgs::LightRoiStart2MHzTick(uint32_t light_frame, uint16_t light_sample) {
+    // The light sample is on the 64MHz clock
+    // Since we are sending with a 32b variable and matching with the TPC (on the 2MHz) clock
+    // we convert the 64MHz sample to the nearest 2MHz tick (64MHz_tick % 32 < 16 = 0) and add the frame * 2MHz
+    double factor_64MHz_to_2Mhz = 32.0; // 32 64MHz ticks for every 2Mhz ticks a hardware constant
+    auto light_sample_dbl = static_cast<double>(light_sample);
+    auto rounded_2MHz_tick = std::round(light_sample_dbl / factor_64MHz_to_2Mhz);
+
+    return static_cast<uint32_t>(rounded_2MHz_tick) + light_frame * tpc_readout_2MHz_ticks_;
+}
+
+
 size_t LightAlgs::GetLightEvent(EventStruct &event) {
     light_cosmic_rois_.resize(event.light_adc.size());
     for (size_t i = 0; i < event.light_adc.size(); i++) {
@@ -86,6 +99,8 @@ size_t LightAlgs::GetLightEvent(EventStruct &event) {
                   event.light_adc[i].end(),
                   light_cosmic_rois_[i].begin());
         light_roi_channels_.push_back(event.light_channel[i]);
+        auto start_tick = LightRoiStart2MHzTick(event.light_frame_number[i], event.light_sample_number[i]);
+        light_roi_start_.push_back(start_tick);
     }
     return light_roi_channels_.size();
 }
@@ -94,6 +109,7 @@ std::vector<uint32_t> LightAlgs::UpdateLightEvent(TpcMonitorLightEvent &tpc_ligh
     if (light_roi_channels_.empty() || light_cosmic_rois_.empty()) return {};
     tpc_light_metric.setChannelNumber(light_roi_channels_[roi]);
     tpc_light_metric.setLightSamples(light_cosmic_rois_[roi]);
+    tpc_light_metric.setStartTick(light_roi_start_[roi]);
 
     return tpc_light_metric.serialize();
 }
@@ -111,4 +127,5 @@ void LightAlgs::Clear() {
         std::fill(light_cosmic_roi.begin(), light_cosmic_roi.end(), 0);
     }
     light_roi_channels_.clear();
+    light_roi_start_.clear();
 }
