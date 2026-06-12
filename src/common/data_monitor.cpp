@@ -25,10 +25,9 @@ namespace data_monitor {
         status_client_ = std::make_shared<TCPConnection>(io_context, ip_address, status_port, is_server, false, true);
         command_client_->Start();
         status_client_->Start();
-        // command_client_.Start();
-        // status_client_.Start();
         process_events_ = std::make_unique<ProcessEvents>(light_slot_, false, std::vector<uint16_t>(), false);
         process_events_->UseEventStride(true);
+        GetEnvVariables();
         std::cout << "DM End" << std::endl;
     }
 
@@ -37,6 +36,17 @@ namespace data_monitor {
         // if this class is destructed with an open file
         process_events_.reset();
     }
+
+    void DataMonitor::GetEnvVariables() {
+        const char *data_basedir = std::getenv("DATA_BASE_DIR");
+
+        if (data_basedir != nullptr) {
+            data_basedir_ = data_basedir;
+        } else {
+            std::cerr << "Environment variable DATA_BASE_DIR does not exist!" << std::endl;
+        }   
+        std::cout << "Data base directory: " << data_basedir_ << std::endl;
+    } 
 
     void DataMonitor::SetRunning(const bool run) {
         is_running_.store(run);
@@ -78,12 +88,9 @@ namespace data_monitor {
     }
 
     void DataMonitor::setFileName(std::vector<uint32_t> &args) {
-        //std::string base_path("/home/pgrams/data/nov2025_integration_data/readout_data/");
-        //std::string base_path("/home/pgrams/data/readout_data/");
-        std::string base_path("/home/pgrams/data/jan13_integration/readout_data/");
         run_number_ = args.at(0);
         file_number_ = args.at(1);
-        monitor_file_ = base_path + "pGRAMS_bin_" + std::to_string(run_number_) + "_" + std::to_string(file_number_) + ".dat";
+        monitor_file_ = data_basedir_ + "pGRAMS_bin_" + std::to_string(run_number_) + "_" + std::to_string(file_number_) + ".dat";
         std::cout << "Requested file: " << monitor_file_ << std::endl;
     }
 

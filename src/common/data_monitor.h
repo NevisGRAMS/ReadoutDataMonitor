@@ -42,6 +42,7 @@ public:
 
 private:
 
+    void GetEnvVariables();
     // Command/Conrol helper fucntions
     void setFileName(std::vector<uint32_t>& args);
     void setNumEvent(std::vector<uint32_t>& args);
@@ -79,6 +80,9 @@ private:
     std::uniform_int_distribution<size_t> event_distrib_;
     std::uniform_int_distribution<uint16_t> charge_channel_distrib_;
     std::uniform_int_distribution<uint16_t> light_channel_distrib_;
+
+    // Base directory for data
+    std::string data_basedir_{};
 
     std::atomic_bool is_running_;
     std::atomic_bool is_decoding_;
