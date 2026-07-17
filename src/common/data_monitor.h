@@ -13,12 +13,22 @@
 #include <random>
 #include <atomic>
 #include <thread>
+#include <mutex>
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace data_monitor {
 
     using namespace pgrams::communication;
+
+struct ReadoutFileCandidate {
+    uint32_t run = 0;
+    uint32_t file = 0;
+    std::string path;
+};
 
 class DataMonitor {
 public:
@@ -42,17 +52,46 @@ public:
 
 private:
 
+    static constexpr uint32_t kAutoRun = 99999;
+    static constexpr uint32_t kAutoFile = 99999;
+    static constexpr uint32_t kMinPeriodSec = 1;
+    static constexpr uint32_t kMaxPeriodSec = 3600;
+
     void GetEnvVariables();
-    // Command/Conrol helper fucntions
     void setFileName(std::vector<uint32_t>& args);
     void setNumEvent(std::vector<uint32_t>& args);
     void setEventNumber(std::vector<uint32_t>& args);
 
-    // Minimal metrics
+    static bool IsAutoRun(uint32_t run);
+    static bool IsAutoFile(uint32_t file);
+
+    std::vector<std::string> ReadoutSearchDirs() const;
+    std::string BuildMonitorFilePath(const std::string& readout_dir, uint32_t run, uint32_t file) const;
+    std::vector<ReadoutFileCandidate> CollectReadoutFiles(uint32_t run_filter) const;
+    std::optional<ReadoutFileCandidate> FindExplicitReadoutFile(uint32_t run, uint32_t file) const;
+    std::optional<ReadoutFileCandidate> FindClosedReadoutFile(uint32_t run_filter, uint32_t file_filter,
+                                                              uint32_t min_file_exclusive) const;
+    std::optional<ReadoutFileCandidate> FindInitialClosedReadoutFile(uint32_t run_filter) const;
+    std::optional<ReadoutFileCandidate> FindNextClosedReadoutFile(uint32_t run_filter, uint32_t after_run,
+                                                                  uint32_t after_file) const;
+    bool ResolveMonitorTarget(uint32_t run, uint32_t file, uint32_t& run_out, uint32_t& file_out,
+                              std::string& path_out) const;
+
+    void RunLbQueryOnCurrentTarget();
+    void StartContinuousLbw(const std::vector<uint32_t>& args);
+    void StopContinuousLbw();
+    void ContinuousLbwLoop();
+    bool OpenContinuousFile(const ReadoutFileCandidate& target);
+    bool ProcessAndSendOneLbEvent();
+    bool AdvanceContinuousToNextClosedFile();
+    bool TryOpenInitialContinuousFile();
+    void ReleaseContinuousFile();
+    bool IsFixedContinuousTarget() const;
+    void StopContinuousLbwLocked(const char* reason);
+
     void CreateMinimalMetrics(EventStruct & event);
     void UpdateMinimalMetrics(size_t evt_number);
 
-    // Send events
     void CreateEventMetrics(EventStruct & event);
     void UpdateEventMetrics(size_t evt_number);
 
@@ -60,17 +99,12 @@ private:
     void SendMetric(std::vector<uint32_t> &metric_vec, uint32_t metric_id);
     void SetMetrics(uint32_t charge_metric, uint32_t light_metric);
 
-    // TCPConnection command_client_;
-    // TCPConnection status_client_;
     std::shared_ptr<TCPConnection> command_client_;
     std::shared_ptr<TCPConnection> status_client_;
     std::unique_ptr<ProcessEvents> process_events_;
 
-    // Seed the random number generator
-    // std::random_device rd;
     std::mt19937 random_generator_;
 
-    // Create a uniform integer distribution object
     constexpr static uint16_t light_slot_ = 16;
     const size_t events_per_file = 5;
     std::vector<size_t> selected_events_;
@@ -81,27 +115,40 @@ private:
     std::uniform_int_distribution<uint16_t> charge_channel_distrib_;
     std::uniform_int_distribution<uint16_t> light_channel_distrib_;
 
-    // Base directory for data
-    std::string data_basedir_{};
+    std::string data_basedir_;
+    std::string data_ssd0_dir_;
+    std::string data_ssd1_dir_;
 
     std::atomic_bool is_running_;
     std::atomic_bool is_decoding_;
 
     std::thread decode_thread_;
+    std::thread continuous_lbw_thread_;
+    std::atomic_bool continuous_lbw_running_{false};
+    std::mutex process_mutex_;
 
-    // The event step size, analyze every N events
+    uint32_t continuous_run_request_ = kAutoRun;
+    uint32_t continuous_file_request_ = kAutoFile;
+    uint32_t continuous_stride_ = 1;
+    uint32_t continuous_period_sec_ = kMinPeriodSec;
+    uint32_t continuous_next_evt_ = 0;
+    uint32_t continuous_resolved_run_ = 0;
+    uint32_t continuous_resolved_file_ = 0;
+    std::string continuous_open_path_;
+    bool continuous_file_open_ = false;
+    bool continuous_had_opened_file_ = false;
+    bool continuous_auto_run_ = true;
+    bool continuous_auto_file_ = true;
+
     size_t process_num_events_;
     size_t event_stride_ = 500;
-    // Set a hard upper limit to ensure no infinite loops while decoding
     constexpr static size_t EVENT_LOOP_MAX = 10000;
 
-    // This struct will hold the metrics
     LowBwTpcMonitor lbw_metrics_;
     TpcMonitor metrics_;
     TpcMonitorChargeEvent charge_event_metric_;
     TpcMonitorLightEvent light_event_metric_;
 
-    // Define the metric algorithm classes
     LightAlgs light_algs_;
     ChargeAlgs charge_algs_;
 
@@ -116,7 +163,6 @@ private:
         kDecodeEvent = 3
     };
 
-    // Function to process the data and create metrics
     std::function<void(EventStruct&)> metric_creator_;
     std::function<void(size_t evt_number)> update_metrics_;
 
