@@ -30,6 +30,15 @@ std::string EnvOrEmpty(const char* name) {
     return value != nullptr ? std::string(value) : std::string{};
 }
 
+std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
+    for (size_t i = 0; i < event.slot_number.size(); ++i) {
+        if (event.slot_number[i] == slot) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
     DataMonitor::DataMonitor(asio::io_context& io_context, const std::string& ip_address, const uint16_t command_port,
@@ -568,6 +577,221 @@ std::string EnvOrEmpty(const char* name) {
         }
     }
 
+    bool DataMonitor::LoadEventsForFullEvent(const uint32_t evt_idx, const uint32_t l_lag,
+                                            EventStruct& base_out, EventStruct& l_header_out,
+                                            EventStruct& l_adc_out, bool& have_l_header,
+                                            bool& have_l_adc) {
+        base_out.clear_event();
+        l_header_out.clear_event();
+        l_adc_out.clear_event();
+        have_l_header = (l_lag == 0);
+        have_l_adc = (l_lag == 0);
+
+        uint32_t max_needed = evt_idx;
+        if (l_lag > 0) {
+            max_needed = std::max(max_needed, evt_idx + l_lag);
+            if (l_lag >= 1) {
+                max_needed = std::max(max_needed, evt_idx + l_lag - 1);
+            }
+        }
+
+        process_events_->RestartFile();
+        process_events_->UseEventStride(false);
+
+        bool got_base = false;
+        while (process_events_->GetEvent()) {
+            const uint32_t idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
+            if (idx == evt_idx) {
+                base_out = process_events_->GetEventStruct();
+                got_base = true;
+            }
+            if (l_lag > 0 && idx == evt_idx + l_lag) {
+                l_header_out = process_events_->GetEventStruct();
+                have_l_header = true;
+            }
+            if (l_lag > 0 && l_lag >= 1 && idx == evt_idx + l_lag - 1) {
+                l_adc_out = process_events_->GetEventStruct();
+                have_l_adc = true;
+            }
+            if (got_base && have_l_header && have_l_adc && idx >= max_needed) {
+                break;
+            }
+        }
+        return got_base;
+    }
+
+    EventStruct DataMonitor::MergeFullEventWithLLag(const EventStruct& base,
+                                                    const EventStruct& l_header,
+                                                    const EventStruct& l_adc,
+                                                    const uint32_t l_lag) const {
+        if (l_lag == 0) {
+            return base;
+        }
+
+        EventStruct merged = base;
+        merged.light_channel = l_adc.light_channel;
+        merged.light_trigger_id = l_adc.light_trigger_id;
+        merged.light_header_tag = l_adc.light_header_tag;
+        merged.light_word_tag = l_adc.light_word_tag;
+        merged.light_frame_number = l_adc.light_frame_number;
+        merged.light_sample_number = l_adc.light_sample_number;
+        merged.light_adc = l_adc.light_adc;
+
+        const auto base_light_idx = FindSlotIndex(base, light_slot_);
+        const auto header_light_idx = FindSlotIndex(l_header, light_slot_);
+        if (!base_light_idx.has_value() || !header_light_idx.has_value()) {
+            return merged;
+        }
+
+        const size_t bi = *base_light_idx;
+        const size_t hi = *header_light_idx;
+        merged.event_number[bi] = l_header.event_number[hi];
+        merged.event_frame_number[bi] = l_header.event_frame_number[hi];
+        merged.trigger_frame_number[bi] = l_header.trigger_frame_number[hi];
+        merged.trigger_sample[bi] = l_header.trigger_sample[hi];
+        return merged;
+    }
+
+    void DataMonitor::SendFemHeaders(const EventStruct& event, const uint32_t evt_idx) {
+        fem_header_metric_.clear();
+        fem_header_metric_.setRunNumber(run_number_);
+        fem_header_metric_.setFileNumber(file_number_);
+        fem_header_metric_.setEvtNumber(evt_idx);
+
+        for (size_t i = 0; i < event.slot_number.size(); ++i) {
+            fem_header_metric_.setSlotNumber(event.slot_number[i]);
+            fem_header_metric_.setEventId(event.event_number[i]);
+            fem_header_metric_.setFrameId(event.event_frame_number[i]);
+            fem_header_metric_.setTriggerFrame(event.trigger_frame_number[i]);
+            fem_header_metric_.setTriggerSample(event.trigger_sample[i]);
+            auto tmp_vec = fem_header_metric_.serialize();
+            SendMetric(tmp_vec, kTelemFemHeader);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    void DataMonitor::SendFullEventPayload(const EventStruct& event, const uint32_t evt_idx,
+                                           uint32_t& num_fem, uint32_t& num_charge,
+                                           uint32_t& num_light) {
+        num_fem = static_cast<uint32_t>(event.slot_number.size());
+        SendFemHeaders(event, evt_idx);
+
+        charge_algs_.GetFullEventChargeEvent(event);
+        num_light = static_cast<uint32_t>(light_algs_.GetLightEvent(event));
+
+        charge_event_metric_.setRunNumber(run_number_);
+        charge_event_metric_.setFileNumber(file_number_);
+        charge_event_metric_.setEvtNumber(evt_idx);
+        light_event_metric_.setRunNumber(run_number_);
+        light_event_metric_.setFileNumber(file_number_);
+        light_event_metric_.setEvtNumber(evt_idx);
+
+        num_charge = NUM_CHARGE_CHANNELS;
+        for (size_t channel = 0; channel < NUM_CHARGE_CHANNELS; ++channel) {
+            auto tmp_vec = charge_algs_.UpdateChargeEvent(charge_event_metric_, channel);
+            SendMetric(tmp_vec, 0x4002);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        for (size_t roi = 0; roi < num_light; ++roi) {
+            auto tmp_vec = light_algs_.UpdateLightEvent(light_event_metric_, roi);
+            if (!tmp_vec.empty()) {
+                SendMetric(tmp_vec, 0x4003);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        charge_algs_.Clear();
+        light_algs_.Clear();
+    }
+
+    void DataMonitor::SendFullEventComplete(const uint32_t evt_idx, const uint32_t l_lag,
+                                            const uint32_t num_fem, const uint32_t num_charge,
+                                            const uint32_t num_light,
+                                            const TpcMonitorFullEventComplete::Status status) {
+        full_event_complete_metric_.clear();
+        full_event_complete_metric_.setRunNumber(run_number_);
+        full_event_complete_metric_.setFileNumber(file_number_);
+        full_event_complete_metric_.setEvtNumber(evt_idx);
+        full_event_complete_metric_.setLLag(l_lag);
+        full_event_complete_metric_.setNumFemHeaders(num_fem);
+        full_event_complete_metric_.setNumChargePackets(num_charge);
+        full_event_complete_metric_.setNumLightPackets(num_light);
+        full_event_complete_metric_.setStatusCode(static_cast<uint32_t>(status));
+        auto tmp_vec = full_event_complete_metric_.serialize();
+        SendMetric(tmp_vec, kTelemFullEventComplete);
+    }
+
+    void DataMonitor::SendFullEventData(const std::vector<uint32_t>& args) {
+        if (args.size() < 4) {
+            std::cerr << "Send full event data requires 4 arguments: run file event l_lag" << std::endl;
+            return;
+        }
+
+        const uint32_t run = args.at(0);
+        const uint32_t file = args.at(1);
+        const uint32_t evt_idx = args.at(2);
+        const uint32_t l_lag = args.at(3);
+
+        run_number_ = run;
+        file_number_ = file;
+
+        const auto target = FindExplicitReadoutFile(run, file);
+        if (!target.has_value()) {
+            std::cerr << "Send full event data: file not found run=" << run << " file=" << file << std::endl;
+            SendFullEventComplete(evt_idx, l_lag, 0, 0, 0, TpcMonitorFullEventComplete::kFileNotFound);
+            return;
+        }
+
+        run_number_ = target->run;
+        file_number_ = target->file;
+        monitor_file_ = target->path;
+
+        process_events_->CloseFile();
+        if (!process_events_->OpenFile(monitor_file_)) {
+            std::cerr << "Send full event data: failed to open " << monitor_file_ << std::endl;
+            SendFullEventComplete(evt_idx, l_lag, 0, 0, 0, TpcMonitorFullEventComplete::kFileNotFound);
+            return;
+        }
+
+        EventStruct base_event;
+        EventStruct l_header_event;
+        EventStruct l_adc_event;
+        bool have_l_header = false;
+        bool have_l_adc = false;
+        if (!LoadEventsForFullEvent(evt_idx, l_lag, base_event, l_header_event, l_adc_event,
+                                     have_l_header, have_l_adc)) {
+            std::cerr << "Send full event data: event " << evt_idx << " not found in " << monitor_file_
+                      << std::endl;
+            SendFullEventComplete(evt_idx, l_lag, 0, 0, 0, TpcMonitorFullEventComplete::kEventNotFound);
+            process_events_->CloseFile();
+            return;
+        }
+
+        if (l_lag > 0 && (!have_l_header || !have_l_adc)) {
+            std::cerr << "Send full event data: L_lag neighbor event missing for evt=" << evt_idx
+                      << " l_lag=" << l_lag << std::endl;
+            SendFullEventComplete(evt_idx, l_lag, 0, 0, 0, TpcMonitorFullEventComplete::kLlagEventNotFound);
+            process_events_->CloseFile();
+            return;
+        }
+
+        const EventStruct merged =
+            MergeFullEventWithLLag(base_event, l_header_event, l_adc_event, l_lag);
+
+        uint32_t num_fem = 0;
+        uint32_t num_charge = 0;
+        uint32_t num_light = 0;
+        SendFullEventPayload(merged, evt_idx, num_fem, num_charge, num_light);
+        SendFullEventComplete(evt_idx, l_lag, num_fem, num_charge, num_light,
+                              TpcMonitorFullEventComplete::kOk);
+        process_events_->CloseFile();
+
+        std::cout << "Send full event data complete run=" << run_number_ << " file=" << file_number_
+                  << " evt=" << evt_idx << " l_lag=" << l_lag << " fem=" << num_fem
+                  << " charge=" << num_charge << " light=" << num_light << std::endl;
+    }
+
     void DataMonitor:: HandleCommand(Command& cmd) {
         std::cout << "Received command: 0x" << std::hex << cmd.command << std::dec << std::endl;
         switch (cmd.command) {
@@ -601,6 +825,14 @@ std::string EnvOrEmpty(const char* name) {
             }
             case static_cast<int>(CommunicationCodes::TPCMonitor_Stop_Continuous_LBW): {
                 StopContinuousLbw();
+                break;
+            }
+            case static_cast<int>(CommunicationCodes::TPCMonitor_Send_Full_Event_Data): {
+                if (cmd.arguments.size() < 4) break;
+                {
+                    std::lock_guard<std::mutex> lock(process_mutex_);
+                    SendFullEventData(cmd.arguments);
+                }
                 break;
             }
             case kDecodeEvent: {
@@ -695,8 +927,9 @@ std::string EnvOrEmpty(const char* name) {
 
     void DataMonitor::CreateEventMetrics(EventStruct & event) {
         charge_algs_.GetChargeEvent(event);
+        num_light_rois_ = light_algs_.GetLightEvent(event);
         if (debug_) std::cout << "Processed charge event.." << std::endl;
-        if (debug_) std::cout << "Processed light event.." << std::endl;
+        if (debug_) std::cout << "Processed light event, rois=" << num_light_rois_ << std::endl;
     }
 
     void DataMonitor::UpdateEventMetrics(size_t evt_number) {

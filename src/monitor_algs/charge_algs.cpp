@@ -90,6 +90,20 @@ void ChargeAlgs::GetChargeEvent(EventStruct &event) {
     }
 }
 
+void ChargeAlgs::GetFullEventChargeEvent(EventStruct &event) {
+    for (size_t j = 0; j < event.charge_adc.size(); j++) {
+        const auto& adc = event.charge_adc[j];
+        const size_t start = FULL_EVENT_CHARGE_START;
+        const size_t end = std::min(FULL_EVENT_CHARGE_END, adc.size());
+        const size_t window_size = (end > start) ? (end - start) : 0;
+        charge_oneframe_samples_[event.charge_channel[j]].resize(window_size);
+        if (window_size > 0) {
+            std::copy(adc.begin() + start, adc.begin() + end,
+                      charge_oneframe_samples_[event.charge_channel[j]].data());
+        }
+    }
+}
+
 std::vector<uint32_t> ChargeAlgs::UpdateChargeEvent(TpcMonitorChargeEvent &tpc_charge_metric, size_t channel) {
     tpc_charge_metric.setChannelNumber(channel);
     tpc_charge_metric.setChargeSamples(charge_oneframe_samples_[channel]);

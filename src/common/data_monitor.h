@@ -10,6 +10,8 @@
 #include "process_events.h"
 #include "light_algs.h"
 #include "charge_algs.h"
+#include "tpc_monitor_fem_header.h"
+#include "tpc_monitor_full_event_complete.h"
 #include <random>
 #include <atomic>
 #include <thread>
@@ -89,6 +91,19 @@ private:
     bool IsFixedContinuousTarget() const;
     void StopContinuousLbwLocked(const char* reason);
 
+    void SendFullEventData(const std::vector<uint32_t>& args);
+    bool LoadEventsForFullEvent(uint32_t evt_idx, uint32_t l_lag, EventStruct& base_out,
+                                EventStruct& l_header_out, EventStruct& l_adc_out,
+                                bool& have_l_header, bool& have_l_adc);
+    EventStruct MergeFullEventWithLLag(const EventStruct& base, const EventStruct& l_header,
+                                       const EventStruct& l_adc, uint32_t l_lag) const;
+    void SendFemHeaders(const EventStruct& event, uint32_t evt_idx);
+    void SendFullEventPayload(const EventStruct& event, uint32_t evt_idx,
+                              uint32_t& num_fem, uint32_t& num_charge, uint32_t& num_light);
+    void SendFullEventComplete(uint32_t evt_idx, uint32_t l_lag, uint32_t num_fem,
+                               uint32_t num_charge, uint32_t num_light,
+                               TpcMonitorFullEventComplete::Status status);
+
     void CreateMinimalMetrics(EventStruct & event);
     void UpdateMinimalMetrics(size_t evt_number);
 
@@ -106,6 +121,9 @@ private:
     std::mt19937 random_generator_;
 
     constexpr static uint16_t light_slot_ = 16;
+    static constexpr uint32_t kTelemFemHeader = 0x4004;
+    static constexpr uint32_t kTelemFullEventComplete = 0x4005;
+    static constexpr uint32_t kSamplesPerFrame = 256;
     const size_t events_per_file = 5;
     std::vector<size_t> selected_events_;
     constexpr static int event_min = 0, event_max = 5000;
@@ -148,6 +166,8 @@ private:
     TpcMonitor metrics_;
     TpcMonitorChargeEvent charge_event_metric_;
     TpcMonitorLightEvent light_event_metric_;
+    TpcMonitorFemHeader fem_header_metric_;
+    TpcMonitorFullEventComplete full_event_complete_metric_;
 
     LightAlgs light_algs_;
     ChargeAlgs charge_algs_;

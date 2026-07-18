@@ -26,6 +26,7 @@ public:
     void HitsAboveThreshold(const std::vector<uint16_t> &channel_charge_words, uint16_t channel);
     // Return an event
     void GetChargeEvent(EventStruct &event);
+    void GetFullEventChargeEvent(EventStruct &event);
     std::vector<uint32_t> UpdateChargeEvent(TpcMonitorChargeEvent &tpc_charge_metric, size_t channel);
 
 private:
