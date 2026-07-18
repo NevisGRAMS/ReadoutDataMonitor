@@ -634,6 +634,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         merged.light_header_tag = l_adc.light_header_tag;
         merged.light_word_tag = l_adc.light_word_tag;
         merged.light_frame_number = l_adc.light_frame_number;
+        merged.light_frame_mod8 = l_adc.light_frame_mod8;
         merged.light_sample_number = l_adc.light_sample_number;
         merged.light_adc = l_adc.light_adc;
 

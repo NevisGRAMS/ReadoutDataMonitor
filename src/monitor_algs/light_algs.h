@@ -5,7 +5,6 @@
 #ifndef LIGHT_ALGS_H
 #define LIGHT_ALGS_H
 
-//#include "monitor_algs_base.hpp"
 #include "tpc_monitor.h"
 #include "process_events.h"
 #include "tpc_monitor_lbw.h"
@@ -16,13 +15,10 @@ public:
     LightAlgs() = default;
     ~LightAlgs() = default;
 
-//    bool ProcessEvent(EventStruct &event) override;
-//    bool UpdateMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics) override;
     void Clear();
 
     void MinimalSummary(EventStruct& event);
     void UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics);
-    // Return an event
     size_t GetLightEvent(EventStruct &event);
     std::vector<uint32_t> UpdateLightEvent(TpcMonitorLightEvent &tpc_light_metric, size_t roi);
     bool isLightRoi() { return !(light_roi_channels_.empty() || light_cosmic_rois_.empty()); }
@@ -31,7 +27,6 @@ public:
     private:
 
     void BaselineRms(const std::vector<uint16_t> &light_roi_words, uint16_t channel);
-    uint32_t LightRoiStart2MHzTick(uint32_t light_frame, uint16_t light_sample);
 
     std::array<double, NUM_LIGHT_CHANNELS> variance_{0};
     std::array<double, NUM_LIGHT_CHANNELS> baseline_{0};
@@ -39,7 +34,8 @@ public:
     std::array<size_t, NUM_LIGHT_CHANNELS> light_baseline_rms_norm_{0};
     std::vector<std::vector<uint32_t>> light_cosmic_rois_{0};
     std::vector<uint16_t> light_roi_channels_{0};
-    std::vector<uint32_t> light_roi_start_{0};
+    std::vector<uint8_t> light_roi_frame_mod8_{0};
+    std::vector<uint16_t> light_roi_sample_64_{0};
     size_t num_events_ = 0;
     uint32_t tpc_readout_2MHz_ticks_ = 255;
 
