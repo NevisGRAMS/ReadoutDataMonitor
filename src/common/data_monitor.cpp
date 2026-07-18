@@ -666,7 +666,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             fem_header_metric_.setTriggerSample(event.trigger_sample[i]);
             auto tmp_vec = fem_header_metric_.serialize();
             SendMetric(tmp_vec, kTelemFemHeader);
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(kFullEventPacketDelayMs));
         }
     }
 
@@ -690,7 +690,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         for (size_t channel = 0; channel < NUM_CHARGE_CHANNELS; ++channel) {
             auto tmp_vec = charge_algs_.UpdateChargeEvent(charge_event_metric_, channel);
             SendMetric(tmp_vec, 0x4002);
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(kFullEventPacketDelayMs));
         }
 
         for (size_t roi = 0; roi < num_light; ++roi) {
@@ -698,7 +698,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             if (!tmp_vec.empty()) {
                 SendMetric(tmp_vec, 0x4003);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(kFullEventPacketDelayMs));
         }
 
         charge_algs_.Clear();
@@ -959,13 +959,13 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
                 auto tmp_vec = charge_algs_.UpdateChargeEvent(charge_event_metric_, i);
                 if (debug_) std::cout << "Updated charge event.." << std::endl;
                 SendMetric(tmp_vec, 0x4002);
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                std::this_thread::sleep_for(std::chrono::milliseconds(kQueryEventPacketDelayMs));
             }
             for (size_t i = 0; i < num_light_rois_; i++) {
                 auto tmp_vec = light_algs_.UpdateLightEvent(light_event_metric_, i);
                 if (debug_) std::cout << "Updated light event.." << std::endl;
                 SendMetric(tmp_vec, 0x4003);
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                std::this_thread::sleep_for(std::chrono::milliseconds(kQueryEventPacketDelayMs));
             }
         }
         charge_algs_.Clear();

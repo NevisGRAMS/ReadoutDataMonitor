@@ -124,6 +124,8 @@ private:
     static constexpr uint32_t kTelemFemHeader = 0x4004;
     static constexpr uint32_t kTelemFullEventComplete = 0x4005;
     static constexpr uint32_t kSamplesPerFrame = 256;
+    static constexpr uint32_t kQueryEventPacketDelayMs = 50;
+    static constexpr uint32_t kFullEventPacketDelayMs = 2;
     const size_t events_per_file = 5;
     std::vector<size_t> selected_events_;
     constexpr static int event_min = 0, event_max = 5000;
