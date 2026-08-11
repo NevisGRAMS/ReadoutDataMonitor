@@ -56,6 +56,8 @@ private:
 
     static constexpr uint32_t kAutoRun = 99999;
     static constexpr uint32_t kAutoFile = 99999;
+    static constexpr uint32_t kAutoEvent = 99999;
+    static constexpr uint32_t kAutoLLag = 99999;
     static constexpr uint32_t kMinPeriodSec = 1;
     static constexpr uint32_t kMaxPeriodSec = 3600;
 
@@ -66,6 +68,19 @@ private:
 
     static bool IsAutoRun(uint32_t run);
     static bool IsAutoFile(uint32_t file);
+    static bool IsAutoEvent(uint32_t event);
+    static bool IsAutoLLag(uint32_t l_lag);
+
+    struct FemStamp {
+        uint32_t event_frame = 0;  // FEMHeader6 event frame (f#)
+        bool valid = false;
+    };
+
+    struct LightLagMatch {
+        uint32_t l_lag = 0;
+        bool exact = false;
+        bool found = false;
+    };
 
     std::vector<std::string> ReadoutSearchDirs() const;
     std::string BuildMonitorFilePath(const std::string& readout_dir, uint32_t run, uint32_t file) const;
@@ -78,6 +93,14 @@ private:
                                                                   uint32_t after_file) const;
     bool ResolveMonitorTarget(uint32_t run, uint32_t file, uint32_t& run_out, uint32_t& file_out,
                               std::string& path_out) const;
+    // Full-event only: each of run/file may be 99999 independently; file must be closed.
+    bool ResolveClosedFullEventFile(uint32_t run, uint32_t file, ReadoutFileCandidate& out) const;
+    bool CountEventsInOpenFile(uint32_t& last_evt_idx);
+    static FemStamp StampFromEvent(const EventStruct& event, uint16_t slot);
+    static FemStamp FirstChargeStamp(const EventStruct& event, uint16_t light_slot);
+    // Auto L_lag: match on f# only (La.f# == Q.f#). t#/s# are checked on ground.
+    static LightLagMatch MatchLightLag(const FemStamp& q,
+                                       const std::vector<FemStamp>& light_from_base_evt);
 
     void RunLbQueryOnCurrentTarget();
     void StartContinuousLbw(const std::vector<uint32_t>& args);
@@ -95,10 +118,11 @@ private:
     bool LoadEventsForFullEvent(uint32_t evt_idx, uint32_t l_lag, EventStruct& base_out,
                                 EventStruct& l_header_out, EventStruct& l_adc_out,
                                 bool& have_l_header, bool& have_l_adc);
+    bool ResolveAutoLightLag(uint32_t evt_idx, uint32_t& l_lag_out, bool& exact_out);
     EventStruct MergeFullEventWithLLag(const EventStruct& base, const EventStruct& l_header,
                                        const EventStruct& l_adc, uint32_t l_lag) const;
     void SendFemHeaders(const EventStruct& event, uint32_t evt_idx);
-    void SendFullEventPayload(const EventStruct& event, uint32_t evt_idx,
+    void SendFullEventPayload(EventStruct& event, uint32_t evt_idx,
                               uint32_t& num_fem, uint32_t& num_charge, uint32_t& num_light);
     void SendFullEventComplete(uint32_t evt_idx, uint32_t l_lag, uint32_t num_fem,
                                uint32_t num_charge, uint32_t num_light,
@@ -125,7 +149,8 @@ private:
     static constexpr uint32_t kTelemFullEventComplete = 0x4005;
     static constexpr uint32_t kSamplesPerFrame = 256;
     static constexpr uint32_t kQueryEventPacketDelayMs = 50;
-    static constexpr uint32_t kFullEventPacketDelayMs = 2;
+    // Pace TCP status packets so Hub/Starlink queues are not flooded.
+    static constexpr uint32_t kFullEventPacketDelayMs = 1;
     const size_t events_per_file = 5;
     std::vector<size_t> selected_events_;
     constexpr static int event_min = 0, event_max = 5000;

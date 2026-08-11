@@ -91,6 +91,174 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         return file == kAutoFile;
     }
 
+    bool DataMonitor::IsAutoEvent(const uint32_t event) {
+        return event == kAutoEvent;
+    }
+
+    bool DataMonitor::IsAutoLLag(const uint32_t l_lag) {
+        return l_lag == kAutoLLag;
+    }
+
+    DataMonitor::FemStamp DataMonitor::StampFromEvent(const EventStruct& event, const uint16_t slot) {
+        FemStamp stamp;
+        const auto idx = FindSlotIndex(event, slot);
+        if (!idx.has_value()) {
+            return stamp;
+        }
+        stamp.event_frame = event.event_frame_number[*idx];
+        stamp.valid = true;
+        return stamp;
+    }
+
+    DataMonitor::FemStamp DataMonitor::FirstChargeStamp(const EventStruct& event,
+                                                        const uint16_t light_slot) {
+        for (size_t i = 0; i < event.slot_number.size(); ++i) {
+            if (event.slot_number[i] == light_slot) {
+                continue;
+            }
+            FemStamp stamp;
+            stamp.event_frame = event.event_frame_number[i];
+            stamp.valid = true;
+            return stamp;
+        }
+        return {};
+    }
+
+    DataMonitor::LightLagMatch DataMonitor::MatchLightLag(const FemStamp& q,
+                                                          const std::vector<FemStamp>& light_from_base_evt) {
+        // Exact: La.f# == Q.f# (last such n wins — n=0 and n=1 both match when
+        // same-event L/Q share f#, and lag=1 is the delayed L header case).
+        // Closest: first Lh.f# that just exceeds Q.f#. t#/s# are not used here.
+        LightLagMatch result;
+        if (!q.valid || light_from_base_evt.empty()) {
+            return result;
+        }
+
+        std::optional<uint32_t> exact_n;
+        std::optional<uint32_t> closest_n;
+        int overshoot = 0;
+        for (uint32_t n = 0; n < light_from_base_evt.size(); ++n) {
+            const FemStamp& lh = light_from_base_evt[n];
+            const FemStamp& la = light_from_base_evt[n == 0 ? 0 : (n - 1)];
+            if (!lh.valid || !la.valid) {
+                continue;
+            }
+
+            if (!closest_n.has_value() && lh.event_frame > q.event_frame) {
+                closest_n = n;
+            }
+
+            if (la.event_frame > q.event_frame) {
+                ++overshoot;
+                if (overshoot >= 3) {
+                    break;
+                }
+            } else {
+                overshoot = 0;
+            }
+
+            if (la.event_frame == q.event_frame) {
+                exact_n = n;
+            }
+        }
+
+        if (exact_n.has_value()) {
+            result.l_lag = *exact_n;
+            result.exact = true;
+            result.found = true;
+            return result;
+        }
+
+        if (closest_n.has_value()) {
+            result.l_lag = *closest_n;
+            result.exact = false;
+            result.found = true;
+            return result;
+        }
+
+        result.l_lag = static_cast<uint32_t>(light_from_base_evt.size() - 1);
+        result.exact = false;
+        result.found = true;
+        return result;
+    }
+
+    bool DataMonitor::ResolveClosedFullEventFile(const uint32_t run, const uint32_t file,
+                                                 ReadoutFileCandidate& out) const {
+        const uint32_t run_filter = IsAutoRun(run) ? kAutoRun : run;
+        const auto files = CollectReadoutFiles(run_filter);
+        if (files.empty()) {
+            return false;
+        }
+
+        auto max_file_for_run = [&](const uint32_t r) -> std::optional<uint32_t> {
+            std::optional<uint32_t> mx;
+            for (const auto& entry : files) {
+                if (entry.run != r) {
+                    continue;
+                }
+                if (!mx.has_value() || entry.file > *mx) {
+                    mx = entry.file;
+                }
+            }
+            return mx;
+        };
+
+        uint32_t resolved_run = run;
+        if (IsAutoRun(run)) {
+            std::optional<uint32_t> best_run;
+            for (const auto& entry : files) {
+                const auto mx = max_file_for_run(entry.run);
+                // Need at least one closed segment: max_file >= 1 → closed = max-1.
+                if (!mx.has_value() || *mx < 1) {
+                    continue;
+                }
+                if (!best_run.has_value() || entry.run > *best_run) {
+                    best_run = entry.run;
+                }
+            }
+            if (!best_run.has_value()) {
+                return false;
+            }
+            resolved_run = *best_run;
+        }
+
+        const auto max_file = max_file_for_run(resolved_run);
+        if (!max_file.has_value() || *max_file < 1) {
+            // Only the live segment exists (or nothing) — no closed file.
+            return false;
+        }
+        const uint32_t closed_max = *max_file - 1;
+
+        uint32_t resolved_file = file;
+        if (IsAutoFile(file)) {
+            resolved_file = closed_max;
+        } else {
+            // Explicit file must exist and be closed (strictly older than the live max).
+            if (file > closed_max) {
+                return false;
+            }
+            resolved_file = file;
+        }
+
+        const auto explicit_file = FindExplicitReadoutFile(resolved_run, resolved_file);
+        if (!explicit_file.has_value()) {
+            return false;
+        }
+        out = *explicit_file;
+        return true;
+    }
+
+    bool DataMonitor::CountEventsInOpenFile(uint32_t& last_evt_idx) {
+        process_events_->RestartFile();
+        process_events_->UseEventStride(false);
+        bool any = false;
+        while (process_events_->GetEvent()) {
+            last_evt_idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
+            any = true;
+        }
+        return any;
+    }
+
     std::vector<std::string> DataMonitor::ReadoutSearchDirs() const {
         std::vector<std::string> dirs;
         auto add_dir = [&](const std::string& base) {
@@ -671,7 +839,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         }
     }
 
-    void DataMonitor::SendFullEventPayload(const EventStruct& event, const uint32_t evt_idx,
+    void DataMonitor::SendFullEventPayload(EventStruct& event, const uint32_t evt_idx,
                                            uint32_t& num_fem, uint32_t& num_charge,
                                            uint32_t& num_light) {
         num_fem = static_cast<uint32_t>(event.slot_number.size());
@@ -723,36 +891,119 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         SendMetric(tmp_vec, kTelemFullEventComplete);
     }
 
+    bool DataMonitor::ResolveAutoLightLag(const uint32_t evt_idx, uint32_t& l_lag_out, bool& exact_out) {
+        process_events_->RestartFile();
+        process_events_->UseEventStride(false);
+
+        FemStamp q_stamp;
+        std::vector<FemStamp> light_from_base;
+        bool got_base = false;
+        int overshoot = 0;
+
+        while (process_events_->GetEvent()) {
+            const uint32_t idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
+            if (idx < evt_idx) {
+                continue;
+            }
+
+            const EventStruct ev = process_events_->GetEventStruct();
+            if (idx == evt_idx) {
+                q_stamp = FirstChargeStamp(ev, light_slot_);
+                got_base = q_stamp.valid;
+            }
+            if (!got_base) {
+                continue;
+            }
+
+            light_from_base.push_back(StampFromEvent(ev, light_slot_));
+
+            // Keep scanning until overshoot/EOF so the last La.f#==Q.f# wins
+            // (returning on the first match would always pick L_lag=0).
+            if (light_from_base.size() >= 2) {
+                const FemStamp& la = light_from_base[light_from_base.size() - 2];
+                if (la.valid && la.event_frame > q_stamp.event_frame) {
+                    ++overshoot;
+                    if (overshoot >= 3) {
+                        break;
+                    }
+                } else {
+                    overshoot = 0;
+                }
+            }
+        }
+
+        if (!got_base || light_from_base.empty()) {
+            return false;
+        }
+
+        const LightLagMatch result = MatchLightLag(q_stamp, light_from_base);
+        if (!result.found) {
+            return false;
+        }
+        l_lag_out = result.l_lag;
+        exact_out = result.exact;
+        return true;
+    }
+
     void DataMonitor::SendFullEventData(const std::vector<uint32_t>& args) {
         if (args.size() < 4) {
             std::cerr << "Send full event data requires 4 arguments: run file event l_lag" << std::endl;
             return;
         }
 
-        const uint32_t run = args.at(0);
-        const uint32_t file = args.at(1);
-        const uint32_t evt_idx = args.at(2);
-        const uint32_t l_lag = args.at(3);
+        const uint32_t run_req = args.at(0);
+        const uint32_t file_req = args.at(1);
+        const uint32_t evt_req = args.at(2);
+        const uint32_t l_lag_req = args.at(3);
 
-        run_number_ = run;
-        file_number_ = file;
-
-        const auto target = FindExplicitReadoutFile(run, file);
-        if (!target.has_value()) {
-            std::cerr << "Send full event data: file not found run=" << run << " file=" << file << std::endl;
-            SendFullEventComplete(evt_idx, l_lag, 0, 0, 0, TpcMonitorFullEventComplete::kFileNotFound);
+        ReadoutFileCandidate target;
+        if (!ResolveClosedFullEventFile(run_req, file_req, target)) {
+            std::cerr << "Send full event data: closed file not found run=" << run_req
+                      << " file=" << file_req << std::endl;
+            SendFullEventComplete(IsAutoEvent(evt_req) ? 0 : evt_req,
+                                  IsAutoLLag(l_lag_req) ? 0 : l_lag_req,
+                                  0, 0, 0, TpcMonitorFullEventComplete::kFileNotFound);
             return;
         }
 
-        run_number_ = target->run;
-        file_number_ = target->file;
-        monitor_file_ = target->path;
+        run_number_ = target.run;
+        file_number_ = target.file;
+        monitor_file_ = target.path;
 
         process_events_->CloseFile();
         if (!process_events_->OpenFile(monitor_file_)) {
             std::cerr << "Send full event data: failed to open " << monitor_file_ << std::endl;
-            SendFullEventComplete(evt_idx, l_lag, 0, 0, 0, TpcMonitorFullEventComplete::kFileNotFound);
+            SendFullEventComplete(IsAutoEvent(evt_req) ? 0 : evt_req,
+                                  IsAutoLLag(l_lag_req) ? 0 : l_lag_req,
+                                  0, 0, 0, TpcMonitorFullEventComplete::kFileNotFound);
             return;
+        }
+
+        uint32_t evt_idx = evt_req;
+        if (IsAutoEvent(evt_req)) {
+            uint32_t last_evt = 0;
+            if (!CountEventsInOpenFile(last_evt)) {
+                std::cerr << "Send full event data: no events in " << monitor_file_ << std::endl;
+                SendFullEventComplete(0, IsAutoLLag(l_lag_req) ? 0 : l_lag_req, 0, 0, 0,
+                                      TpcMonitorFullEventComplete::kEventNotFound);
+                process_events_->CloseFile();
+                return;
+            }
+            evt_idx = last_evt;
+            std::cout << "Send full event data: auto event -> " << evt_idx << std::endl;
+        }
+
+        uint32_t l_lag = l_lag_req;
+        bool l_lag_exact = true;
+        if (IsAutoLLag(l_lag_req)) {
+            if (!ResolveAutoLightLag(evt_idx, l_lag, l_lag_exact)) {
+                std::cerr << "Send full event data: auto L_lag failed for evt=" << evt_idx << std::endl;
+                SendFullEventComplete(evt_idx, 0, 0, 0, 0, TpcMonitorFullEventComplete::kLlagEventNotFound);
+                process_events_->CloseFile();
+                return;
+            }
+            std::cout << "Send full event data: auto L_lag -> " << l_lag
+                      << (l_lag_exact ? " (exact)" : " (closest)") << std::endl;
         }
 
         EventStruct base_event;
@@ -777,20 +1028,26 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             return;
         }
 
-        const EventStruct merged =
+        const EventStruct merged_const =
             MergeFullEventWithLLag(base_event, l_header_event, l_adc_event, l_lag);
+        EventStruct merged = merged_const;
 
         uint32_t num_fem = 0;
         uint32_t num_charge = 0;
         uint32_t num_light = 0;
         SendFullEventPayload(merged, evt_idx, num_fem, num_charge, num_light);
-        SendFullEventComplete(evt_idx, l_lag, num_fem, num_charge, num_light,
-                              TpcMonitorFullEventComplete::kOk);
+
+        const auto status = (!IsAutoLLag(l_lag_req) || l_lag_exact)
+                                ? TpcMonitorFullEventComplete::kOk
+                                : TpcMonitorFullEventComplete::kLlagUsedClosest;
+        SendFullEventComplete(evt_idx, l_lag, num_fem, num_charge, num_light, status);
         process_events_->CloseFile();
 
         std::cout << "Send full event data complete run=" << run_number_ << " file=" << file_number_
-                  << " evt=" << evt_idx << " l_lag=" << l_lag << " fem=" << num_fem
-                  << " charge=" << num_charge << " light=" << num_light << std::endl;
+                  << " evt=" << evt_idx << " l_lag=" << l_lag
+                  << " status=" << static_cast<uint32_t>(status)
+                  << " fem=" << num_fem << " charge=" << num_charge << " light=" << num_light
+                  << std::endl;
     }
 
     void DataMonitor:: HandleCommand(Command& cmd) {
