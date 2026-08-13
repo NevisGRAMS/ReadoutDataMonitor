@@ -460,24 +460,15 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     bool DataMonitor::ResolveMonitorTarget(const uint32_t run, const uint32_t file, uint32_t& run_out,
                                            uint32_t& file_out, std::string& path_out) const {
-        if (!IsAutoRun(run) && !IsAutoFile(file)) {
-            const auto explicit_file = FindExplicitReadoutFile(run, file);
-            if (!explicit_file.has_value()) {
-                return false;
-            }
-            run_out = explicit_file->run;
-            file_out = explicit_file->file;
-            path_out = explicit_file->path;
-            return true;
-        }
-
-        const auto closed = FindClosedReadoutFile(run, file, 0);
-        if (!closed.has_value()) {
+        // All monitor queries: closed files only (never the live max segment).
+        // run/file may each be 99999 independently.
+        ReadoutFileCandidate closed;
+        if (!ResolveClosedFullEventFile(run, file, closed)) {
             return false;
         }
-        run_out = closed->run;
-        file_out = closed->file;
-        path_out = closed->path;
+        run_out = closed.run;
+        file_out = closed.file;
+        path_out = closed.path;
         return true;
     }
 
@@ -518,18 +509,31 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         if (process_num_events_ > 5000) process_num_events_ = 5000;
     }
 
-    void DataMonitor::setFileName(std::vector<uint32_t> &args) {
+    bool DataMonitor::setFileName(std::vector<uint32_t> &args) {
         run_number_ = args.at(0);
         file_number_ = args.at(1);
         uint32_t resolved_run = run_number_;
         uint32_t resolved_file = file_number_;
         if (!ResolveMonitorTarget(run_number_, file_number_, resolved_run, resolved_file, monitor_file_)) {
+            std::cerr << "Monitor file not available (missing or not closed) run=" << run_number_
+                      << " file=" << file_number_ << std::endl;
             monitor_file_.clear();
-            return;
+            return false;
         }
         run_number_ = resolved_run;
         file_number_ = resolved_file;
         std::cout << "Requested file: " << monitor_file_ << std::endl;
+        return true;
+    }
+
+    void DataMonitor::SendLbFileUnavailableStatus(const uint32_t run_req, const uint32_t file_req) {
+        lbw_metrics_.clear();
+        lbw_metrics_.setRunNumber(run_req);
+        lbw_metrics_.setFileNumber(file_req);
+        lbw_metrics_.setEvtNumber(0);
+        lbw_metrics_.setErrorBitWord(LowBwTpcMonitor::ErrorBits::file_not_closed);
+        auto tmp_vec = lbw_metrics_.serialize();
+        SendMetric(tmp_vec, 0x4001);
     }
 
     void DataMonitor::RunLbQueryOnCurrentTarget() {
@@ -561,18 +565,15 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         }
 
         continuous_run_request_ = args.at(1);
-        if (IsAutoRun(continuous_run_request_)) {
-            continuous_file_request_ = kAutoFile;
-        } else {
-            continuous_file_request_ = args.at(2);
-        }
+        continuous_file_request_ = args.at(2);
         continuous_stride_ = args.at(3);
         if (continuous_stride_ == 0) {
             continuous_stride_ = 1;
         }
 
+        // run/file 99999 are independent (do not force file=99999 when run is auto).
         continuous_auto_run_ = IsAutoRun(continuous_run_request_);
-        continuous_auto_file_ = continuous_auto_run_ || IsAutoFile(continuous_file_request_);
+        continuous_auto_file_ = IsAutoFile(continuous_file_request_);
         continuous_next_evt_ = 0;
         continuous_resolved_run_ = 0;
         continuous_resolved_file_ = 0;
@@ -630,24 +631,36 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         return true;
     }
 
-    bool DataMonitor::ProcessAndSendOneLbEvent() {
-        const uint32_t target_evt = continuous_next_evt_;
+    bool DataMonitor::ProcessAndSendLbFileAverage() {
+        process_events_->RestartFile();
+        process_events_->UseEventStride(false);
+        charge_algs_.Clear();
+        light_algs_.Clear();
+        lbw_metrics_.clear();
 
+        uint32_t n_sampled = 0;
+        uint32_t last_evt = 0;
         while (process_events_->GetEvent()) {
-            const size_t evt_idx = process_events_->GetLastEventIndex();
-            if (evt_idx != target_evt) {
+            const uint32_t evt_idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
+            // Stride from the first event: 0, stride, 2*stride, ...
+            if ((evt_idx % continuous_stride_) != 0) {
                 continue;
             }
-
             EventStruct evt_data = process_events_->GetEventStruct();
             CreateMinimalMetrics(evt_data);
-            UpdateMinimalMetrics(evt_idx);
-            charge_algs_.Clear();
-            light_algs_.Clear();
-            continuous_next_evt_ += continuous_stride_;
-            return true;
+            last_evt = evt_idx;
+            ++n_sampled;
         }
-        return false;
+
+        if (n_sampled == 0) {
+            return false;
+        }
+
+        UpdateMinimalMetrics(last_evt);
+        continuous_next_evt_ = last_evt + continuous_stride_;
+        std::cout << "Continuous LBW averaged " << n_sampled << " events (stride="
+                  << continuous_stride_ << ") from " << continuous_open_path_ << std::endl;
+        return true;
     }
 
     bool DataMonitor::IsFixedContinuousTarget() const {
@@ -663,22 +676,30 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
     }
 
     bool DataMonitor::TryOpenInitialContinuousFile() {
-        std::optional<ReadoutFileCandidate> target;
-        if (IsFixedContinuousTarget()) {
-            target = FindExplicitReadoutFile(continuous_run_request_, continuous_file_request_);
-        } else {
-            const uint32_t run_filter = continuous_auto_run_ ? kAutoRun : continuous_run_request_;
-            if (!continuous_had_opened_file_) {
-                target = FindInitialClosedReadoutFile(run_filter);
-            } else {
-                target = FindNextClosedReadoutFile(run_filter, continuous_resolved_run_, continuous_resolved_file_);
+        // Always closed-only; run/file 99999 resolved independently.
+        if (!continuous_had_opened_file_) {
+            ReadoutFileCandidate target;
+            if (!ResolveClosedFullEventFile(continuous_run_request_, continuous_file_request_, target)) {
+                return false;
             }
+            return OpenContinuousFile(target);
         }
 
-        if (!target.has_value()) {
+        if (IsFixedContinuousTarget()) {
+            return false;  // Fixed target is processed once.
+        }
+
+        const uint32_t run_filter = continuous_auto_run_ ? kAutoRun : continuous_run_request_;
+        const auto next = FindNextClosedReadoutFile(run_filter, continuous_resolved_run_,
+                                                    continuous_resolved_file_);
+        if (!next.has_value()) {
             return false;
         }
-        return OpenContinuousFile(*target);
+        // If file# was explicit (not 99999), only accept that file number.
+        if (!continuous_auto_file_ && next->file != continuous_file_request_) {
+            return false;
+        }
+        return OpenContinuousFile(*next);
     }
 
     bool DataMonitor::AdvanceContinuousToNextClosedFile() {
@@ -691,19 +712,29 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         if (!next.has_value() || next->path == continuous_open_path_) {
             return false;
         }
+        if (!continuous_auto_file_ && next->file != continuous_file_request_) {
+            return false;
+        }
         return OpenContinuousFile(*next);
     }
 
     void DataMonitor::ContinuousLbwLoop() {
+        // period_sec: poll interval while waiting for the next closed file.
+        // Each closed file → stride-sample from event 0 → one averaged 0x4001 packet.
         while (continuous_lbw_running_.load()) {
             bool waiting_for_file = false;
+            bool processed_file = false;
             {
                 std::lock_guard<std::mutex> lock(process_mutex_);
 
                 if (!continuous_file_open_) {
                     if (!TryOpenInitialContinuousFile()) {
-                        if (IsFixedContinuousTarget()) {
-                            StopContinuousLbwLocked("fixed run/file not available");
+                        if (IsFixedContinuousTarget() && continuous_had_opened_file_) {
+                            StopContinuousLbwLocked("fixed run/file done");
+                            break;
+                        }
+                        if (IsFixedContinuousTarget() && !continuous_had_opened_file_) {
+                            StopContinuousLbwLocked("fixed run/file not available (need closed file)");
                             break;
                         }
                         waiting_for_file = true;
@@ -711,26 +742,29 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
                 }
 
                 if (continuous_file_open_ && !waiting_for_file) {
-                    if (ProcessAndSendOneLbEvent()) {
+                    if (ProcessAndSendLbFileAverage()) {
+                        processed_file = true;
                         std::cout << "Continuous LBW sent run=" << continuous_resolved_run_
-                                  << " file=" << continuous_resolved_file_
-                                  << " evt=" << (continuous_next_evt_ >= continuous_stride_
-                                                  ? continuous_next_evt_ - continuous_stride_
-                                                  : 0) << std::endl;
+                                  << " file=" << continuous_resolved_file_ << std::endl;
                     } else {
-                        if (IsFixedContinuousTarget()) {
-                            StopContinuousLbwLocked("fixed run/file exhausted");
-                            break;
-                        }
-                        ReleaseContinuousFile();
-                        if (!AdvanceContinuousToNextClosedFile()) {
-                            waiting_for_file = true;
-                            std::cout << "Continuous LBW waiting for next closed readout file (run="
-                                      << continuous_resolved_run_ << " file=" << continuous_resolved_file_
-                                      << ")" << std::endl;
-                        }
+                        std::cerr << "Continuous LBW: no events sampled in "
+                                  << continuous_open_path_ << std::endl;
                     }
-                } else if (waiting_for_file && !IsFixedContinuousTarget()) {
+
+                    if (IsFixedContinuousTarget()) {
+                        ReleaseContinuousFile();
+                        StopContinuousLbwLocked("fixed run/file exhausted");
+                        break;
+                    }
+
+                    ReleaseContinuousFile();
+                    if (!AdvanceContinuousToNextClosedFile()) {
+                        waiting_for_file = true;
+                        std::cout << "Continuous LBW waiting for next closed readout file (after run="
+                                  << continuous_resolved_run_ << " file=" << continuous_resolved_file_
+                                  << ")" << std::endl;
+                    }
+                } else if (waiting_for_file) {
                     std::cout << "Continuous LBW waiting for closed readout file..." << std::endl;
                 }
             }
@@ -739,8 +773,16 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
                 break;
             }
 
-            for (uint32_t slept = 0; slept < continuous_period_sec_ && continuous_lbw_running_.load(); ++slept) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Sleep after a send or while waiting; if another closed file is already
+            // open from Advance, loop immediately without sleeping.
+            if (waiting_for_file || processed_file) {
+                if (continuous_file_open_ && !waiting_for_file) {
+                    continue;
+                }
+                for (uint32_t slept = 0; slept < continuous_period_sec_ && continuous_lbw_running_.load();
+                     ++slept) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
             }
         }
     }
@@ -1057,7 +1099,10 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
                 if (cmd.arguments.size() < 4) break;
                 {
                     std::lock_guard<std::mutex> lock(process_mutex_);
-                    setFileName(cmd.arguments);
+                    if (!setFileName(cmd.arguments)) {
+                        SendLbFileUnavailableStatus(cmd.arguments.at(0), cmd.arguments.at(1));
+                        break;
+                    }
                     setNumEvent(cmd.arguments);
                     RunLbQueryOnCurrentTarget();
                 }
@@ -1067,7 +1112,11 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
                 if (cmd.arguments.size() < 4) break;
                 {
                     std::lock_guard<std::mutex> lock(process_mutex_);
-                    setFileName(cmd.arguments);
+                    if (!setFileName(cmd.arguments)) {
+                        // Event query has no dedicated status packet; reuse 0x4001 error stub.
+                        SendLbFileUnavailableStatus(cmd.arguments.at(0), cmd.arguments.at(1));
+                        break;
+                    }
                     setEventNumber(cmd.arguments);
                     choose_random_ = cmd.arguments.at(3) == 1;
 
@@ -1136,20 +1185,25 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     void DataMonitor::GetEventMetrics() {
         if (debug_) std::cout << "entering processing" << std::endl;
-        process_events_->SetEventStride(event_stride_);
+        // Walk every event; sample indices 0, stride, 2*stride, ... up to process_num_events_.
+        process_events_->UseEventStride(false);
 
         size_t event_count = 0;
-        while (process_events_->GetEvent() && (event_count < process_num_events_) && (event_count < EVENT_LOOP_MAX)) {
-            if ((event_count % event_stride_) != 0 || (event_count == 0 && process_num_events_ != 1)) {
+        size_t n_sampled = 0;
+        const size_t n_wanted = (event_stride_ == 0) ? 1 : (process_num_events_ / event_stride_);
+        while (process_events_->GetEvent() && (event_count < process_num_events_) &&
+               (event_count < EVENT_LOOP_MAX) && (n_sampled < n_wanted)) {
+            if ((event_count % event_stride_) != 0) {
                 event_count++;
                 continue;
             }
             if (debug_) std::cout << "Processing event: " << event_count << std::endl;
             EventStruct evt_data = process_events_->GetEventStruct();
             metric_creator_(evt_data);
+            ++n_sampled;
             event_count++;
         }
-        update_metrics_(event_count);
+        update_metrics_(event_count > 0 ? event_count - 1 : 0);
     }
 
     void DataMonitor::SendMetric(std::vector<uint32_t> &metric_vec, uint32_t metric_id) {

@@ -62,9 +62,12 @@ private:
     static constexpr uint32_t kMaxPeriodSec = 3600;
 
     void GetEnvVariables();
-    void setFileName(std::vector<uint32_t>& args);
+    // Resolves run/file (99999 independent). Closed files only. Returns false on failure.
+    bool setFileName(std::vector<uint32_t>& args);
     void setNumEvent(std::vector<uint32_t>& args);
     void setEventNumber(std::vector<uint32_t>& args);
+    // Send a 0x4001 stub with file_not_closed when a query cannot open a closed file.
+    void SendLbFileUnavailableStatus(uint32_t run_req, uint32_t file_req);
 
     static bool IsAutoRun(uint32_t run);
     static bool IsAutoFile(uint32_t file);
@@ -93,7 +96,7 @@ private:
                                                                   uint32_t after_file) const;
     bool ResolveMonitorTarget(uint32_t run, uint32_t file, uint32_t& run_out, uint32_t& file_out,
                               std::string& path_out) const;
-    // Full-event only: each of run/file may be 99999 independently; file must be closed.
+    // run/file may each be 99999 independently; resolved file must be closed (not the live max).
     bool ResolveClosedFullEventFile(uint32_t run, uint32_t file, ReadoutFileCandidate& out) const;
     bool CountEventsInOpenFile(uint32_t& last_evt_idx);
     static FemStamp StampFromEvent(const EventStruct& event, uint16_t slot);
@@ -107,7 +110,8 @@ private:
     void StopContinuousLbw();
     void ContinuousLbwLoop();
     bool OpenContinuousFile(const ReadoutFileCandidate& target);
-    bool ProcessAndSendOneLbEvent();
+    // Stride-sample the open file from event 0, average, send one 0x4001 packet.
+    bool ProcessAndSendLbFileAverage();
     bool AdvanceContinuousToNextClosedFile();
     bool TryOpenInitialContinuousFile();
     void ReleaseContinuousFile();
