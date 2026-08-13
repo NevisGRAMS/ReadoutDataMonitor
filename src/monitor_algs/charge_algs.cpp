@@ -5,78 +5,108 @@
 #include "charge_algs.h"
 
 #include <cmath>
-#include <numeric>
 #include <algorithm>
 
-
-//bool ChargeAlgs::ProcessEvent(EventStruct &event) {
-//    return true;
-//}
-
 void ChargeAlgs::MinimalSummary(EventStruct &event) {
-
-    for (const auto &channel : event.charge_channel) {
-        BaselineRms(event.charge_adc.at(channel), channel);
-        HitsAboveThreshold(event.charge_adc.at(channel), channel); // needs to always follow baseline & RMS
+    for (size_t j = 0; j < event.charge_channel.size(); ++j) {
+        const uint16_t channel = event.charge_channel[j];
+        if (channel >= NUM_CHARGE_CHANNELS) {
+            continue;
+        }
+        BaselineRmsAndPeaks(event.charge_adc[j], channel);
     }
     num_events_++;
 }
 
-void ChargeAlgs::BaselineRms(const std::vector<uint16_t> &channel_charge_words, uint16_t channel) {
-    // Calculate the baseline and RMS for the channel, only use the first 5 samples
-    double num_samples = 10;
-
-    double baseline_sum = 0;
-    for (size_t i = 0; i < num_samples; i++) { baseline_sum += channel_charge_words[i]; }
-    baseline_sum /= num_samples;
-    baseline_[channel] += baseline_sum;
-
-    // Use the averged baseline as it gives a better std. dev. estimate
-    double baseline_sub = baseline_[channel] / (num_events_ + 1);
-    double variance_sum = 0;
-    for (size_t i = 0; i < num_samples; i++) {
-        variance_sum += (channel_charge_words[i] - baseline_sub) * (channel_charge_words[i] - baseline_sub);
+void ChargeAlgs::BaselineRmsAndPeaks(const std::vector<uint16_t>& adc, uint16_t channel) {
+    if (adc.empty()) {
+        return;
     }
-    variance_sum /= num_samples;
-    variance_[channel] += variance_sum;
-}
 
-void ChargeAlgs::HitsAboveThreshold(const std::vector<uint16_t> &channel_charge_words, uint16_t channel) {
-    // Use baseline shifted threshold instead of baseline subtraction to avoid pesky 16b int overflows
-    double rms_threshold = 5.0;
-    double threshold = baseline_[channel] + rms_threshold * std::abs(variance_[channel]) + 1.0;
-
-    for (auto adc_word : channel_charge_words) {
-        if (adc_word > threshold) charge_hits_[channel]++;
+    // Waveform is trigger-aligned: t0 = CHARGE_START_SAMPLES (256), not the
+    // FEMHeader6 in-frame trigger_sample (0–255). Pedestal [0, t0−10).
+    const int end = std::min(static_cast<int>(CHARGE_START_SAMPLES) - kPreTriggerGuard,
+                             static_cast<int>(adc.size()));
+    if (end < 2) {
+        return;
     }
+
+    uint16_t lo = adc[0];
+    uint16_t hi = adc[0];
+    double sum = 0.0;
+    for (int i = 0; i < end; ++i) {
+        const uint16_t v = adc[i];
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+        sum += v;
+    }
+
+    // Dirty pre-trigger: drop this event from the run average of baseline,
+    // RMS, and hit# (per-event DQM can still compute it separately).
+    if (static_cast<uint16_t>(hi - lo) > kPedestalMaxMinReject) {
+        return;
+    }
+
+    const double ped = sum / static_cast<double>(end);
+    double var_sum = 0.0;
+    for (int i = 0; i < end; ++i) {
+        const double d = adc[i] - ped;
+        var_sum += d * d;
+    }
+    const double rms = std::sqrt(var_sum / static_cast<double>(end));
+
+    const double threshold = ped + std::max(kPeakAbsFloorAdc, kPeakRmsSigma * rms);
+    bool above = false;
+    int width = 0;
+    size_t hits = 0;
+    for (const uint16_t sample : adc) {
+        if (sample > threshold) {
+            if (!above) {
+                above = true;
+                width = 1;
+            } else {
+                width++;
+            }
+        } else if (above) {
+            if (width >= kPeakMinWidth) {
+                hits++;
+            }
+            above = false;
+            width = 0;
+        }
+    }
+    if (above && width >= kPeakMinWidth) {
+        hits++;
+    }
+
+    baseline_[channel] += ped;
+    rms_sum_[channel] += rms;
+    charge_hits_[channel] += static_cast<double>(hits);
+    accepted_norm_[channel]++;
 }
 
 void ChargeAlgs::UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics) {
-
-    if (num_events_ < 1) { num_events_ = 1; } // Avoid divide by 0
-    /*
-     * Finish the aggregated Baseline & RMS calculation and update the metrics
-     * Average hits per event and the charge hits to the metrics
-     */
+    (void)metrics;
+    if (num_events_ < 1) {
+        num_events_ = 1;
+    }
     std::cout << "num_events_ = " << num_events_ << std::endl;
     std::array<uint32_t, NUM_CHARGE_CHANNELS> baseline_int{};
     std::array<uint32_t, NUM_CHARGE_CHANNELS> rms_int{};
     std::array<uint32_t, NUM_CHARGE_CHANNELS> avg_hits_int{};
     for (size_t i = 0; i < NUM_CHARGE_CHANNELS; i++) {
-        // if (i < 10) std::cout << i << ":" << baseline_[i] / num_events_ << "|" << rms_[i] / num_events_ << "|" << charge_hits_[i] << std::endl;
-        baseline_int[i] = static_cast<uint32_t>(baseline_[i] / num_events_);
-        // TODO could perform the sqrt on ground for safety and efficiency
-        // check to make sure rms is non-negative, should never be but better to avoid NaN
-        rms_int[i] = static_cast<uint32_t>((variance_[i] < 0) ? INT16_MAX : 15 * (std::sqrt(variance_[i] / num_events_)));
-        avg_hits_int[i] = static_cast<uint32_t>(15 * (charge_hits_[i] / num_events_));
-        // if (i < 10) std::cout << "  ->" << baseline_int[i] << "|" << rms_int[i] << "|" << avg_hits_int[i] << std::endl;
+        if (accepted_norm_[i] == 0) {
+            continue;
+        }
+        const double n = static_cast<double>(accepted_norm_[i]);
+        baseline_int[i] = static_cast<uint32_t>(std::lround(LBW_BASELINE_SCALE * (baseline_[i] / n)));
+        rms_int[i] = static_cast<uint32_t>(std::lround(LBW_RMS_SCALE * (rms_sum_[i] / n)));
+        avg_hits_int[i] = static_cast<uint32_t>(std::lround(LBW_HIT_SCALE * (charge_hits_[i] / n)));
     }
 
-    // Update the metrics
     lbw_metrics.setChargeBaselines(baseline_int);
     lbw_metrics.setChargeRms(rms_int);
     lbw_metrics.setAvgNumHits(avg_hits_int);
-
 }
 
 void ChargeAlgs::GetChargeEvent(EventStruct &event) {
@@ -111,18 +141,13 @@ std::vector<uint32_t> ChargeAlgs::UpdateChargeEvent(TpcMonitorChargeEvent &tpc_c
     return tpc_charge_metric.serialize();
 }
 
-
 void ChargeAlgs::Clear() {
-    // Clear the metrics between queries
     for (size_t i = 0; i < NUM_CHARGE_CHANNELS; i++) {
         baseline_[i] = 0;
-        variance_[i] = 0;
+        rms_sum_[i] = 0;
         charge_hits_[i] = 0;
+        accepted_norm_[i] = 0;
         std::fill(charge_oneframe_samples_[i].begin(), charge_oneframe_samples_[i].end(), 0);
     }
     num_events_ = 0;
 }
-
-//bool ChargeAlgs::UpdateMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics) {
-//    return true;
-//}

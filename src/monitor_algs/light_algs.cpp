@@ -4,53 +4,95 @@
 
 #include "light_algs.h"
 #include <cmath>
-#include <asio/detail/event.hpp>
+#include <algorithm>
 
 
 void LightAlgs::MinimalSummary(EventStruct &event) {
     std::cout << "Size ID/Ch/ROI: " << event.light_trigger_id.size() << "/"
             << event.light_channel.size() << "/" << event.light_adc.size() << std::endl;
 
+    std::array<double, NUM_LIGHT_CHANNELS> ev_ped{};
+    std::array<double, NUM_LIGHT_CHANNELS> ev_rms{};
+    std::array<size_t, NUM_LIGHT_CHANNELS> ev_n_quiet{};
+    std::array<size_t, NUM_LIGHT_CHANNELS> ev_n_roi{};
+
     for (size_t i = 0; i < event.light_channel.size(); i++) {
-        if (event.light_channel[i] > NUM_LIGHT_CHANNELS-1) continue;
-        if (event.light_trigger_id.at(i) != BEAM_GATE_DISC_ID) {
-            light_rois_[event.light_channel.at(i)]++;
+        const uint16_t channel = event.light_channel[i];
+        if (channel > NUM_LIGHT_CHANNELS - 1) {
             continue;
         }
-        light_baseline_rms_norm_[event.light_channel.at(i)]++;
-        BaselineRms(event.light_adc.at(i), event.light_channel.at(i));
+        ev_n_roi[channel]++;
+        double ped = 0.0;
+        double rms = 0.0;
+        if (QuietPedestal(event.light_adc[i], ped, rms)) {
+            ev_ped[channel] += ped;
+            ev_rms[channel] += rms;
+            ev_n_quiet[channel]++;
+        }
+    }
+
+    for (size_t ch = 0; ch < NUM_LIGHT_CHANNELS; ch++) {
+        if (ev_n_roi[ch] == 0) {
+            continue;
+        }
+        light_rois_[ch] += ev_n_roi[ch];
+        if (ev_n_quiet[ch] == 0) {
+            continue;
+        }
+        baseline_[ch] += ev_ped[ch] / static_cast<double>(ev_n_quiet[ch]);
+        rms_sum_[ch] += ev_rms[ch] / static_cast<double>(ev_n_quiet[ch]);
+        light_baseline_rms_norm_[ch]++;
     }
     num_events_++;
 }
 
-void LightAlgs::BaselineRms(const std::vector<uint16_t> &light_roi_words, uint16_t channel) {
-    size_t num_samples = light_roi_words.size() > 7 ? 8 : light_roi_words.size();
-    if (num_samples < 1) return;
-
-    double baseline_sum = 0;
-    for (size_t i = 0; i < num_samples; i++) { baseline_sum += light_roi_words[i]; }
-    baseline_sum /= num_samples;
-    baseline_[channel] += baseline_sum;
-
-    double variance_sum = 0;
-    for (size_t i = 0; i < num_samples; i++) {
-        variance_sum += (light_roi_words[i] - baseline_sum) * (light_roi_words[i] - baseline_sum);
+bool LightAlgs::QuietPedestal(const std::vector<uint16_t> &light_roi_words,
+                              double &ped, double &rms) const {
+    if (light_roi_words.size() < kTailExcludeLast + kTailSamples) {
+        return false;
     }
-    variance_sum /= num_samples;
-    variance_[channel] += variance_sum;
+    // Pedestal window [-22, -3] (20 samples), dropping the last two ticks.
+    const size_t start = light_roi_words.size() - kTailExcludeLast - kTailSamples;
+    const size_t end = light_roi_words.size() - kTailExcludeLast;
+    uint16_t lo = light_roi_words[start];
+    uint16_t hi = light_roi_words[start];
+    double sum = 0.0;
+    for (size_t i = start; i < end; ++i) {
+        const uint16_t v = light_roi_words[i];
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+        sum += v;
+    }
+    if (static_cast<uint16_t>(hi - lo) > kTailMaxMinReject) {
+        return false;
+    }
+
+    ped = sum / static_cast<double>(kTailSamples);
+    double var_sum = 0.0;
+    for (size_t i = start; i < end; ++i) {
+        const double d = light_roi_words[i] - ped;
+        var_sum += d * d;
+    }
+    rms = std::sqrt(var_sum / static_cast<double>(kTailSamples));
+    return true;
 }
 
 
 void LightAlgs::UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics) {
+    (void)metrics;
     if (num_events_ < 1) { num_events_ = 1; }
 
     std::array<uint32_t, NUM_LIGHT_CHANNELS> baseline_int{};
     std::array<uint32_t, NUM_LIGHT_CHANNELS> rms_int{};
     std::array<uint32_t, NUM_LIGHT_CHANNELS> avg_rois_int{};
     for (size_t i = 0; i < NUM_LIGHT_CHANNELS; i++) {
-        baseline_int[i] = static_cast<int>(baseline_[i] / light_baseline_rms_norm_[i]);
-        rms_int[i] = static_cast<int>((variance_[i] < 0) ? INT16_MAX : 15 * (std::sqrt(variance_[i] / light_baseline_rms_norm_[i])));
-        avg_rois_int[i] = static_cast<uint32_t>(15 * (light_rois_[i] / num_events_));
+        if (light_baseline_rms_norm_[i] > 0) {
+            const double n = static_cast<double>(light_baseline_rms_norm_[i]);
+            baseline_int[i] = static_cast<uint32_t>(std::lround(LBW_BASELINE_SCALE * (baseline_[i] / n)));
+            rms_int[i] = static_cast<uint32_t>(std::lround(LBW_RMS_SCALE * (rms_sum_[i] / n)));
+        }
+        avg_rois_int[i] = static_cast<uint32_t>(
+            std::lround(LBW_HIT_SCALE * (light_rois_[i] / static_cast<double>(num_events_))));
     }
 
     lbw_metrics.setLightBaselines(baseline_int);
@@ -90,7 +132,7 @@ std::vector<uint32_t> LightAlgs::UpdateLightEvent(TpcMonitorLightEvent &tpc_ligh
 
 void LightAlgs::Clear() {
     for (size_t i = 0; i < NUM_LIGHT_CHANNELS; i++) {
-        variance_[i] = 0;
+        rms_sum_[i] = 0;
         baseline_[i] = 0;
         light_rois_[i] = 0;
         light_baseline_rms_norm_[i] = 0;
@@ -102,4 +144,5 @@ void LightAlgs::Clear() {
     light_roi_channels_.clear();
     light_roi_frame_mod8_.clear();
     light_roi_sample_64_.clear();
+    num_events_ = 0;
 }
