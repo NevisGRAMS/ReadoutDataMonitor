@@ -17,7 +17,10 @@ public:
 
     void Clear();
     void MinimalSummary(EventStruct &event);
+    // TpcMonitor& is unused: 0x4001 has no histogram / SEM fields.
     void UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics);
+    // Deprecated: old Query_Event_Data (0x4002) middle-1/3 slice.
+    // Full-event telemetry uses GetFullEventChargeEvent ([248, 520)).
     void GetChargeEvent(EventStruct &event);
     void GetFullEventChargeEvent(EventStruct &event);
     std::vector<uint32_t> UpdateChargeEvent(TpcMonitorChargeEvent &tpc_charge_metric, size_t channel);
@@ -31,6 +34,7 @@ private:
 
     void BaselineRmsAndPeaks(const std::vector<uint16_t>& adc, uint16_t channel);
 
+    // Deprecated: leftover from TpcMonitor histogram LBW; never filled.
     Histogram charge_histogram_{1024, 4096, 16};
 
     std::array<double, NUM_CHARGE_CHANNELS> baseline_{0};

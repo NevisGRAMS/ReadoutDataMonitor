@@ -79,7 +79,7 @@ bool LightAlgs::QuietPedestal(const std::vector<uint16_t> &light_roi_words,
 
 
 void LightAlgs::UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics) {
-    (void)metrics;
+    (void)metrics;  // Deprecated TpcMonitor histogram path; 0x4001 has no SEM fields.
     if (num_events_ < 1) { num_events_ = 1; }
 
     std::array<uint32_t, NUM_LIGHT_CHANNELS> baseline_int{};
@@ -102,13 +102,19 @@ void LightAlgs::UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &m
 
 
 size_t LightAlgs::GetLightEvent(EventStruct &event) {
-    light_cosmic_rois_.resize(event.light_adc.size());
+    // Compact all discriminator IDs (name light_cosmic_rois_ is historical).
+    // Indexing used to be sparse by original ROI i while channels_ was
+    // compacted, so UpdateLightEvent(roi) pulled the wrong waveform.
+    light_cosmic_rois_.clear();
+    light_roi_channels_.clear();
+    light_roi_frame_mod8_.clear();
+    light_roi_sample_64_.clear();
+    light_cosmic_rois_.reserve(event.light_adc.size());
     for (size_t i = 0; i < event.light_adc.size(); i++) {
-        if (event.light_trigger_id[i] != COSMIC_DISC_ID) continue;
-        light_cosmic_rois_[i].resize(event.light_adc[i].size());
+        light_cosmic_rois_.emplace_back(event.light_adc[i].size());
         std::copy(event.light_adc[i].begin(),
                   event.light_adc[i].end(),
-                  light_cosmic_rois_[i].begin());
+                  light_cosmic_rois_.back().begin());
         light_roi_channels_.push_back(event.light_channel[i]);
         light_roi_frame_mod8_.push_back(
             i < event.light_frame_mod8.size()

@@ -1108,6 +1108,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
                 }
                 break;
             }
+            // Deprecated: old per-channel event dump. Use SendFullEventData (0x4004/0x4002/0x4003/0x4005).
             case static_cast<int>(CommunicationCodes::TPCMonitor_Query_Event_Data): {
                 if (cmd.arguments.size() < 4) break;
                 {
@@ -1237,6 +1238,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         light_algs_.Clear();
     }
 
+    // Deprecated: old Query_Event_Data path (GetChargeEvent middle-1/3).
     void DataMonitor::CreateEventMetrics(EventStruct & event) {
         charge_algs_.GetChargeEvent(event);
         num_light_rois_ = light_algs_.GetLightEvent(event);
@@ -1244,6 +1246,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         if (debug_) std::cout << "Processed light event, rois=" << num_light_rois_ << std::endl;
     }
 
+    // Deprecated: old Query_Event_Data sender (0x4002/0x4003).
     void DataMonitor::UpdateEventMetrics(size_t evt_number) {
         if (debug_) std::cout << "Updating Event Metrics.." << std::endl;
         charge_event_metric_.setRunNumber(run_number_);

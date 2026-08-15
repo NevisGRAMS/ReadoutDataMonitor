@@ -86,7 +86,7 @@ void ChargeAlgs::BaselineRmsAndPeaks(const std::vector<uint16_t>& adc, uint16_t 
 }
 
 void ChargeAlgs::UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics) {
-    (void)metrics;
+    (void)metrics;  // Deprecated TpcMonitor histogram path; 0x4001 has no SEM fields.
     if (num_events_ < 1) {
         num_events_ = 1;
     }
@@ -99,6 +99,7 @@ void ChargeAlgs::UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &
             continue;
         }
         const double n = static_cast<double>(accepted_norm_[i]);
+        // Pack means only. 0x4001 has no SEM / error-on-the-mean fields.
         baseline_int[i] = static_cast<uint32_t>(std::lround(LBW_BASELINE_SCALE * (baseline_[i] / n)));
         rms_int[i] = static_cast<uint32_t>(std::lround(LBW_RMS_SCALE * (rms_sum_[i] / n)));
         avg_hits_int[i] = static_cast<uint32_t>(std::lround(LBW_HIT_SCALE * (charge_hits_[i] / n)));
@@ -109,6 +110,8 @@ void ChargeAlgs::UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &
     lbw_metrics.setAvgNumHits(avg_hits_int);
 }
 
+// Deprecated: old per-channel event packet. Takes the middle third of the
+// 763-sample waveform (~254 samples). Superseded by GetFullEventChargeEvent.
 void ChargeAlgs::GetChargeEvent(EventStruct &event) {
     std::cout << event.charge_adc.size() << "/" << charge_oneframe_samples_.size() << std::endl;
     for (size_t j = 0; j < event.charge_adc.size(); j++) {

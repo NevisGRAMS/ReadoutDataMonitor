@@ -18,7 +18,9 @@ public:
     void Clear();
 
     void MinimalSummary(EventStruct& event);
+    // TpcMonitor& is unused: 0x4001 has no histogram / SEM fields.
     void UpdateMinimalMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics);
+    // Compact all light ROIs for 0x4003 (full-event and deprecated query).
     size_t GetLightEvent(EventStruct &event);
     std::vector<uint32_t> UpdateLightEvent(TpcMonitorLightEvent &tpc_light_metric, size_t roi);
     bool isLightRoi() { return !(light_roi_channels_.empty() || light_cosmic_rois_.empty()); }

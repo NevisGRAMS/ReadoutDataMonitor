@@ -135,9 +135,12 @@ private:
     void CreateMinimalMetrics(EventStruct & event);
     void UpdateMinimalMetrics(size_t evt_number);
 
+    // Deprecated: TPCMonitor_Query_Event_Data — random/all-channel 0x4002/0x4003
+    // using GetChargeEvent (middle 1/3). Full-event telemetry is SendFullEventData.
     void CreateEventMetrics(EventStruct & event);
     void UpdateEventMetrics(size_t evt_number);
 
+    // Deprecated: old TpcMonitor histogram LBW. Current path is SendMetric(0x4001).
     void SendMetrics(LowBwTpcMonitor &lbw_metrics, TpcMonitor &metrics);
     void SendMetric(std::vector<uint32_t> &metric_vec, uint32_t metric_id);
     void SetMetrics(uint32_t charge_metric, uint32_t light_metric);
@@ -194,7 +197,7 @@ private:
     constexpr static size_t EVENT_LOOP_MAX = 10000;
 
     LowBwTpcMonitor lbw_metrics_;
-    TpcMonitor metrics_;
+    TpcMonitor metrics_;  // Deprecated: old histogram LBW, not serialized.
     TpcMonitorChargeEvent charge_event_metric_;
     TpcMonitorLightEvent light_event_metric_;
     TpcMonitorFemHeader fem_header_metric_;
