@@ -591,16 +591,18 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
     }
 
     void DataMonitor::StopContinuousLbw() {
-        if (!continuous_lbw_running_.load()) {
-            return;
-        }
-        continuous_lbw_running_.store(false);
+        // Always join if the worker exists. The loop may have already cleared
+        // continuous_lbw_running_ (fixed run/file done); skipping join then
+        // assigning a new std::thread would std::terminate().
+        const bool was_running = continuous_lbw_running_.exchange(false);
         if (continuous_lbw_thread_.joinable()) {
             continuous_lbw_thread_.join();
         }
         continuous_file_open_ = false;
         continuous_open_path_.clear();
-        std::cout << "Stopped continuous LBW" << std::endl;
+        if (was_running) {
+            std::cout << "Stopped continuous LBW" << std::endl;
+        }
     }
 
     bool DataMonitor::OpenContinuousFile(const ReadoutFileCandidate& target) {
@@ -730,14 +732,16 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
                 if (!continuous_file_open_) {
                     if (!TryOpenInitialContinuousFile()) {
                         if (IsFixedContinuousTarget() && continuous_had_opened_file_) {
-                            StopContinuousLbwLocked("fixed run/file done");
-                            break;
+                            // Already sent the one requested file; stay idle until Stop.
+                            waiting_for_file = true;
+                        } else if (IsFixedContinuousTarget() && !continuous_had_opened_file_) {
+                            waiting_for_file = true;
+                            std::cout << "Continuous LBW waiting for closed run="
+                                      << continuous_run_request_ << " file="
+                                      << continuous_file_request_ << std::endl;
+                        } else {
+                            waiting_for_file = true;
                         }
-                        if (IsFixedContinuousTarget() && !continuous_had_opened_file_) {
-                            StopContinuousLbwLocked("fixed run/file not available (need closed file)");
-                            break;
-                        }
-                        waiting_for_file = true;
                     }
                 }
 
@@ -751,20 +755,19 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
                                   << continuous_open_path_ << std::endl;
                     }
 
-                    if (IsFixedContinuousTarget()) {
-                        ReleaseContinuousFile();
-                        StopContinuousLbwLocked("fixed run/file exhausted");
-                        break;
-                    }
-
                     ReleaseContinuousFile();
-                    if (!AdvanceContinuousToNextClosedFile()) {
+                    if (IsFixedContinuousTarget()) {
+                        waiting_for_file = true;
+                        std::cout << "Continuous LBW idle (fixed run/file sent once); "
+                                  << "Stop Continuous LBW to exit" << std::endl;
+                    } else if (!AdvanceContinuousToNextClosedFile()) {
                         waiting_for_file = true;
                         std::cout << "Continuous LBW waiting for next closed readout file (after run="
                                   << continuous_resolved_run_ << " file=" << continuous_resolved_file_
                                   << ")" << std::endl;
                     }
-                } else if (waiting_for_file) {
+                } else if (waiting_for_file &&
+                           !(IsFixedContinuousTarget() && continuous_had_opened_file_)) {
                     std::cout << "Continuous LBW waiting for closed readout file..." << std::endl;
                 }
             }
