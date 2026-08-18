@@ -988,6 +988,14 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
     bool DataMonitor::ResolveAutoLightLag(const uint32_t evt_idx, uint32_t& l_lag_out, bool& exact_out) {
         process_events_->RestartFile();
         process_events_->UseEventStride(false);
+        // Match uses Q/L event_frame from FEM headers only. Skip ADC/ROI unpack
+        // so a late-run lag of tens of events does not fully decode each one.
+        // Restore payload decode even on early return (LoadEvents needs it).
+        struct HeaderOnlyGuard {
+            ProcessEvents* pe;
+            explicit HeaderOnlyGuard(ProcessEvents* pe) : pe(pe) { pe->SetDecodePayload(false); }
+            ~HeaderOnlyGuard() { pe->SetDecodePayload(true); }
+        } header_only(process_events_.get());
 
         FemStamp q_stamp;
         std::vector<FemStamp> light_from_base;
