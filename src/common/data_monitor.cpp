@@ -9,6 +9,7 @@
 #include <regex>
 #include <chrono>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 
 namespace data_monitor {
@@ -28,6 +29,21 @@ std::string JoinPath(const std::string& base, const std::string& leaf) {
 std::string EnvOrEmpty(const char* name) {
     const char* value = std::getenv(name);
     return value != nullptr ? std::string(value) : std::string{};
+}
+
+bool EnvFlagOrDefault(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    std::string s(value);
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (s == "0" || s == "false" || s == "off" || s == "no") {
+        return false;
+    }
+    return true;
 }
 
 std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
@@ -58,6 +74,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         status_client_->Start();
         process_events_ = std::make_unique<ProcessEvents>(light_slot_, false, std::vector<uint16_t>(), false);
         process_events_->UseEventStride(true);
+        process_events_->SetExpectedSlots({13, 14, 15, light_slot_});
         GetEnvVariables();
         std::cout << "DM End" << std::endl;
     }
@@ -81,6 +98,9 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         for (const auto& dir : ReadoutSearchDirs()) {
             std::cout << "Readout search directory: " << dir << std::endl;
         }
+
+        include_error_counts_ = EnvFlagOrDefault("LBW_ERROR_BIT_COUNTS", true);
+        std::cout << "LBW_ERROR_BIT_COUNTS: " << (include_error_counts_ ? "on" : "off") << std::endl;
     }
 
     bool DataMonitor::IsAutoRun(const uint32_t run) {
@@ -531,7 +551,12 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         lbw_metrics_.setRunNumber(run_req);
         lbw_metrics_.setFileNumber(file_req);
         lbw_metrics_.setEvtNumber(0);
-        lbw_metrics_.setErrorBitWord(LowBwTpcMonitor::ErrorBits::file_not_closed);
+        lbw_metrics_.setEmitErrorBitCounts(include_error_counts_);
+        if (include_error_counts_) {
+            lbw_metrics_.setPacketStatusBit(LowBwTpcMonitor::PacketStatusBits::file_not_closed);
+        } else {
+            lbw_metrics_.setLegacyFileNotClosedBit();
+        }
         auto tmp_vec = lbw_metrics_.serialize();
         SendMetric(tmp_vec, 0x4001);
     }
@@ -587,7 +612,8 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         std::cout << "Started continuous LBW: period=" << continuous_period_sec_
                   << "s run=" << continuous_run_request_
                   << " file=" << continuous_file_request_
-                  << " stride=" << continuous_stride_ << std::endl;
+                  << " stride=" << continuous_stride_
+                  << " error_counts=" << (include_error_counts_ ? "on" : "off") << std::endl;
     }
 
     void DataMonitor::StopContinuousLbw() {
@@ -645,6 +671,9 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         uint32_t n_sampled = 0;
         uint32_t last_evt = 0;
         while (process_events_->GetEvent()) {
+            if (include_error_counts_) {
+                lbw_metrics_.addErrorBitCounts(process_events_->getErrorBitword());
+            }
             EventStruct evt_data = process_events_->GetEventStruct();
             CreateMinimalMetrics(evt_data);
             last_evt = static_cast<uint32_t>(process_events_->GetLastEventIndex());
@@ -793,12 +822,13 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
     bool DataMonitor::LoadEventsForFullEvent(const uint32_t evt_idx, const uint32_t l_lag,
                                             EventStruct& base_out, EventStruct& l_header_out,
                                             EventStruct& l_adc_out, bool& have_l_header,
-                                            bool& have_l_adc) {
+                                            bool& have_l_adc, uint32_t& event_error_out) {
         base_out.clear_event();
         l_header_out.clear_event();
         l_adc_out.clear_event();
         have_l_header = (l_lag == 0);
         have_l_adc = (l_lag == 0);
+        event_error_out = 0;
 
         uint32_t max_needed = evt_idx;
         if (l_lag > 0) {
@@ -832,6 +862,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             const uint32_t idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
             if (idx == evt_idx) {
                 base_out = process_events_->GetEventStruct();
+                event_error_out = process_events_->getErrorBitword();
                 got_base = true;
             }
             if (l_lag > 0 && idx == evt_idx + l_lag) {
@@ -938,7 +969,8 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
     void DataMonitor::SendFullEventComplete(const uint32_t evt_idx, const uint32_t l_lag,
                                             const uint32_t num_fem, const uint32_t num_charge,
                                             const uint32_t num_light,
-                                            const TpcMonitorFullEventComplete::Status status) {
+                                            const TpcMonitorFullEventComplete::Status status,
+                                            const uint32_t event_error_bit_word) {
         full_event_complete_metric_.clear();
         full_event_complete_metric_.setRunNumber(run_number_);
         full_event_complete_metric_.setFileNumber(file_number_);
@@ -948,6 +980,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         full_event_complete_metric_.setNumChargePackets(num_charge);
         full_event_complete_metric_.setNumLightPackets(num_light);
         full_event_complete_metric_.setStatusCode(static_cast<uint32_t>(status));
+        full_event_complete_metric_.setEventErrorBitWord(event_error_bit_word);
         auto tmp_vec = full_event_complete_metric_.serialize();
         SendMetric(tmp_vec, kTelemFullEventComplete);
     }
@@ -1078,8 +1111,9 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         EventStruct l_adc_event;
         bool have_l_header = false;
         bool have_l_adc = false;
+        uint32_t event_error = 0;
         if (!LoadEventsForFullEvent(evt_idx, l_lag, base_event, l_header_event, l_adc_event,
-                                     have_l_header, have_l_adc)) {
+                                     have_l_header, have_l_adc, event_error)) {
             std::cerr << "Send full event data: event " << evt_idx << " not found in " << monitor_file_
                       << std::endl;
             SendFullEventComplete(evt_idx, l_lag, 0, 0, 0, TpcMonitorFullEventComplete::kEventNotFound);
@@ -1107,7 +1141,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         const auto status = (!IsAutoLLag(l_lag_req) || l_lag_exact)
                                 ? TpcMonitorFullEventComplete::kOk
                                 : TpcMonitorFullEventComplete::kLlagUsedClosest;
-        SendFullEventComplete(evt_idx, l_lag, num_fem, num_charge, num_light, status);
+        SendFullEventComplete(evt_idx, l_lag, num_fem, num_charge, num_light, status, event_error);
         process_events_->CloseFile();
 
         std::cout << "Send full event data complete run=" << run_number_ << " file=" << file_number_
@@ -1214,6 +1248,9 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         // Walk every event; sample indices 0, stride, 2*stride, ... up to process_num_events_.
         process_events_->UseEventStride(true);
         process_events_->SetEventStride(event_stride_ == 0 ? 1 : event_stride_);
+        charge_algs_.Clear();
+        light_algs_.Clear();
+        lbw_metrics_.clear();
 
         size_t n_sampled = 0;
         uint32_t last_evt = 0;
@@ -1223,6 +1260,9 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             const uint32_t idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
             if (idx >= process_num_events_) {
                 break;
+            }
+            if (include_error_counts_) {
+                lbw_metrics_.addErrorBitCounts(process_events_->getErrorBitword());
             }
             if (debug_) std::cout << "Processing event: " << idx << std::endl;
             EventStruct evt_data = process_events_->GetEventStruct();
@@ -1251,6 +1291,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         lbw_metrics_.setRunNumber(run_number_);
         lbw_metrics_.setFileNumber(file_number_);
         lbw_metrics_.setEvtNumber(static_cast<uint32_t>(evt_number));
+        lbw_metrics_.setEmitErrorBitCounts(include_error_counts_);
         charge_algs_.UpdateMinimalMetrics(lbw_metrics_, metrics_);
         if (debug_) std::cout << "Updated charge.." << std::endl;
         light_algs_.UpdateMinimalMetrics(lbw_metrics_, metrics_);

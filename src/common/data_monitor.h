@@ -121,7 +121,7 @@ private:
     void SendFullEventData(const std::vector<uint32_t>& args);
     bool LoadEventsForFullEvent(uint32_t evt_idx, uint32_t l_lag, EventStruct& base_out,
                                 EventStruct& l_header_out, EventStruct& l_adc_out,
-                                bool& have_l_header, bool& have_l_adc);
+                                bool& have_l_header, bool& have_l_adc, uint32_t& event_error_out);
     bool ResolveAutoLightLag(uint32_t evt_idx, uint32_t& l_lag_out, bool& exact_out);
     EventStruct MergeFullEventWithLLag(const EventStruct& base, const EventStruct& l_header,
                                        const EventStruct& l_adc, uint32_t l_lag) const;
@@ -130,7 +130,8 @@ private:
                               uint32_t& num_fem, uint32_t& num_charge, uint32_t& num_light);
     void SendFullEventComplete(uint32_t evt_idx, uint32_t l_lag, uint32_t num_fem,
                                uint32_t num_charge, uint32_t num_light,
-                               TpcMonitorFullEventComplete::Status status);
+                               TpcMonitorFullEventComplete::Status status,
+                               uint32_t event_error_bit_word = 0);
 
     void CreateMinimalMetrics(EventStruct & event);
     void UpdateMinimalMetrics(size_t evt_number);
@@ -191,6 +192,7 @@ private:
     bool continuous_had_opened_file_ = false;
     bool continuous_auto_run_ = true;
     bool continuous_auto_file_ = true;
+    bool include_error_counts_ = true;
 
     size_t process_num_events_;
     size_t event_stride_ = 500;
