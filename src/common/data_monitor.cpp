@@ -252,7 +252,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         process_events_->RestartFile();
         process_events_->UseEventStride(false);
         bool any = false;
-        while (process_events_->GetEvent()) {
+        while (process_events_->SkipOneEvent()) {
             last_evt_idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
             any = true;
         }
@@ -617,7 +617,8 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             return false;
         }
         process_events_->RestartFile();
-        process_events_->UseEventStride(false);
+        process_events_->UseEventStride(true);
+        process_events_->SetEventStride(continuous_stride_ == 0 ? 1 : continuous_stride_);
 
         continuous_open_path_ = target.path;
         continuous_resolved_run_ = target.run;
@@ -635,7 +636,8 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     bool DataMonitor::ProcessAndSendLbFileAverage() {
         process_events_->RestartFile();
-        process_events_->UseEventStride(false);
+        process_events_->UseEventStride(true);
+        process_events_->SetEventStride(continuous_stride_ == 0 ? 1 : continuous_stride_);
         charge_algs_.Clear();
         light_algs_.Clear();
         lbw_metrics_.clear();
@@ -643,14 +645,9 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         uint32_t n_sampled = 0;
         uint32_t last_evt = 0;
         while (process_events_->GetEvent()) {
-            const uint32_t evt_idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
-            // Stride from the first event: 0, stride, 2*stride, ...
-            if ((evt_idx % continuous_stride_) != 0) {
-                continue;
-            }
             EventStruct evt_data = process_events_->GetEventStruct();
             CreateMinimalMetrics(evt_data);
-            last_evt = evt_idx;
+            last_evt = static_cast<uint32_t>(process_events_->GetLastEventIndex());
             ++n_sampled;
         }
 
@@ -780,6 +777,9 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             // open from Advance, loop immediately without sleeping.
             if (waiting_for_file || processed_file) {
                 if (continuous_file_open_ && !waiting_for_file) {
+                    // Mutex was dropped after this file; yield so a waiting
+                    // SendFullEventData can run before the next closed file.
+                    std::this_thread::yield();
                     continue;
                 }
                 for (uint32_t slept = 0; slept < continuous_period_sec_ && continuous_lbw_running_.load();
@@ -812,7 +812,23 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         process_events_->UseEventStride(false);
 
         bool got_base = false;
-        while (process_events_->GetEvent()) {
+        while (true) {
+            const uint32_t upcoming = static_cast<uint32_t>(process_events_->NextEventIndex());
+            const bool need = (upcoming == evt_idx) ||
+                              (l_lag > 0 && upcoming == evt_idx + l_lag) ||
+                              (l_lag >= 1 && upcoming == evt_idx + l_lag - 1);
+            if (!need) {
+                if (upcoming > max_needed) {
+                    break;
+                }
+                if (!process_events_->SkipOneEvent()) {
+                    break;
+                }
+                continue;
+            }
+            if (!process_events_->GetEvent()) {
+                break;
+            }
             const uint32_t idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
             if (idx == evt_idx) {
                 base_out = process_events_->GetEventStruct();
@@ -944,6 +960,12 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         std::vector<FemStamp> light_from_base;
         bool got_base = false;
         int overshoot = 0;
+
+        while (process_events_->NextEventIndex() < evt_idx) {
+            if (!process_events_->SkipOneEvent()) {
+                return false;
+            }
+        }
 
         while (process_events_->GetEvent()) {
             const uint32_t idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
@@ -1190,24 +1212,25 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
     void DataMonitor::GetEventMetrics() {
         if (debug_) std::cout << "entering processing" << std::endl;
         // Walk every event; sample indices 0, stride, 2*stride, ... up to process_num_events_.
-        process_events_->UseEventStride(false);
+        process_events_->UseEventStride(true);
+        process_events_->SetEventStride(event_stride_ == 0 ? 1 : event_stride_);
 
-        size_t event_count = 0;
         size_t n_sampled = 0;
+        uint32_t last_evt = 0;
         const size_t n_wanted = (event_stride_ == 0) ? 1 : (process_num_events_ / event_stride_);
-        while (process_events_->GetEvent() && (event_count < process_num_events_) &&
-               (event_count < EVENT_LOOP_MAX) && (n_sampled < n_wanted)) {
-            if ((event_count % event_stride_) != 0) {
-                event_count++;
-                continue;
+        while (process_events_->GetEvent() && (n_sampled < n_wanted) &&
+               (n_sampled < EVENT_LOOP_MAX)) {
+            const uint32_t idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
+            if (idx >= process_num_events_) {
+                break;
             }
-            if (debug_) std::cout << "Processing event: " << event_count << std::endl;
+            if (debug_) std::cout << "Processing event: " << idx << std::endl;
             EventStruct evt_data = process_events_->GetEventStruct();
             metric_creator_(evt_data);
+            last_evt = idx;
             ++n_sampled;
-            event_count++;
         }
-        update_metrics_(event_count > 0 ? event_count - 1 : 0);
+        update_metrics_(last_evt);
     }
 
     void DataMonitor::SendMetric(std::vector<uint32_t> &metric_vec, uint32_t metric_id) {
