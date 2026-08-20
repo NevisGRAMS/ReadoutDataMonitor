@@ -73,7 +73,6 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         command_client_->Start();
         status_client_->Start();
         process_events_ = std::make_unique<ProcessEvents>(light_slot_, false, std::vector<uint16_t>(), false);
-        process_events_->UseEventStride(true);
         process_events_->SetExpectedSlots({13, 14, 15, light_slot_});
         GetEnvVariables();
         std::cout << "DM End" << std::endl;
@@ -270,7 +269,6 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     bool DataMonitor::CountEventsInOpenFile(uint32_t& last_evt_idx) {
         process_events_->RestartFile();
-        process_events_->UseEventStride(false);
         bool any = false;
         while (process_events_->SkipOneEvent()) {
             last_evt_idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
@@ -515,16 +513,15 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     void DataMonitor::setNumEvent(std::vector<uint32_t> &args) {
         uint32_t num_events_ = args.at(2);
-        event_stride_ = args.at(3);
-        event_stride_ = event_stride_ == 0 ? event_stride_ + 1 : event_stride_;
-        process_num_events_ = num_events_ * event_stride_;
-        if (process_num_events_ > 5000) process_num_events_ = 5000;
+        if (num_events_ == 0) num_events_ = 1;
+        process_num_events_ = num_events_;
+        if (process_num_events_ != kAutoEvent && process_num_events_ > 5000) {
+            process_num_events_ = 5000;
+        }
     }
 
     void DataMonitor::setEventNumber(std::vector<uint32_t> &args) {
         uint32_t event_number = args.at(2);
-        event_stride_ = event_number;
-        event_stride_ = event_stride_ == 0 ? event_stride_ + 1 : event_stride_;
         process_num_events_ = event_number + 1;
         if (process_num_events_ > 5000) process_num_events_ = 5000;
     }
@@ -576,7 +573,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     void DataMonitor::StartContinuousLbw(const std::vector<uint32_t>& args) {
         if (args.size() < 4) {
-            std::cerr << "Start continuous LBW requires 4 arguments: period_sec run file event_stride" << std::endl;
+            std::cerr << "Start continuous LBW requires 4 arguments: period_sec run file n_event" << std::endl;
             return;
         }
 
@@ -591,9 +588,9 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
         continuous_run_request_ = args.at(1);
         continuous_file_request_ = args.at(2);
-        continuous_stride_ = args.at(3);
-        if (continuous_stride_ == 0) {
-            continuous_stride_ = 1;
+        continuous_n_event_ = args.at(3);
+        if (continuous_n_event_ == 0) {
+            continuous_n_event_ = 1;
         }
 
         // run/file 99999 are independent (do not force file=99999 when run is auto).
@@ -612,7 +609,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         std::cout << "Started continuous LBW: period=" << continuous_period_sec_
                   << "s run=" << continuous_run_request_
                   << " file=" << continuous_file_request_
-                  << " stride=" << continuous_stride_
+                  << " n_event=" << continuous_n_event_
                   << " error_counts=" << (include_error_counts_ ? "on" : "off") << std::endl;
     }
 
@@ -643,8 +640,6 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             return false;
         }
         process_events_->RestartFile();
-        process_events_->UseEventStride(true);
-        process_events_->SetEventStride(continuous_stride_ == 0 ? 1 : continuous_stride_);
 
         continuous_open_path_ = target.path;
         continuous_resolved_run_ = target.run;
@@ -662,14 +657,13 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     bool DataMonitor::ProcessAndSendLbFileAverage() {
         process_events_->RestartFile();
-        process_events_->UseEventStride(true);
-        process_events_->SetEventStride(continuous_stride_ == 0 ? 1 : continuous_stride_);
         charge_algs_.Clear();
         light_algs_.Clear();
         lbw_metrics_.clear();
 
         uint32_t n_sampled = 0;
         uint32_t last_evt = 0;
+        const bool all_events = (continuous_n_event_ == kAutoEvent);
         while (process_events_->GetEvent()) {
             if (include_error_counts_) {
                 lbw_metrics_.addErrorBitCounts(process_events_->getErrorBitword());
@@ -678,6 +672,9 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             CreateMinimalMetrics(evt_data);
             last_evt = static_cast<uint32_t>(process_events_->GetLastEventIndex());
             ++n_sampled;
+            if (!all_events && n_sampled >= continuous_n_event_) {
+                break;  // do not decode the rest of the file
+            }
         }
 
         if (n_sampled == 0) {
@@ -685,9 +682,8 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         }
 
         UpdateMinimalMetrics(last_evt);
-        continuous_next_evt_ = last_evt + continuous_stride_;
-        std::cout << "Continuous LBW averaged " << n_sampled << " events (stride="
-                  << continuous_stride_ << ") from " << continuous_open_path_ << std::endl;
+        std::cout << "Continuous LBW averaged " << n_sampled << " events (n_event="
+                  << continuous_n_event_ << ") from " << continuous_open_path_ << std::endl;
         return true;
     }
 
@@ -748,7 +744,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     void DataMonitor::ContinuousLbwLoop() {
         // period_sec: poll interval while waiting for the next closed file.
-        // Each closed file → stride-sample from event 0 → one averaged 0x4001 packet.
+        // Each closed file → events 0..n_event-1 (99999 = all) → one 0x4001.
         while (continuous_lbw_running_.load()) {
             bool waiting_for_file = false;
             bool processed_file = false;
@@ -839,7 +835,6 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         }
 
         process_events_->RestartFile();
-        process_events_->UseEventStride(false);
 
         bool got_base = false;
         while (true) {
@@ -987,7 +982,6 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     bool DataMonitor::ResolveAutoLightLag(const uint32_t evt_idx, uint32_t& l_lag_out, bool& exact_out) {
         process_events_->RestartFile();
-        process_events_->UseEventStride(false);
         // Match uses Q/L event_frame from FEM headers only. Skip ADC/ROI unpack
         // so a late-run lag of tens of events does not fully decode each one.
         // Restore payload decode even on early return (LoadEvents needs it).
@@ -1253,22 +1247,18 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
 
     void DataMonitor::GetEventMetrics() {
         if (debug_) std::cout << "entering processing" << std::endl;
-        // Walk every event; sample indices 0, stride, 2*stride, ... up to process_num_events_.
-        process_events_->UseEventStride(true);
-        process_events_->SetEventStride(event_stride_ == 0 ? 1 : event_stride_);
+        // Decode events 0 .. n_event-1 (99999 = whole file, still capped by EVENT_LOOP_MAX).
         charge_algs_.Clear();
         light_algs_.Clear();
         lbw_metrics_.clear();
 
         size_t n_sampled = 0;
         uint32_t last_evt = 0;
-        const size_t n_wanted = (event_stride_ == 0) ? 1 : (process_num_events_ / event_stride_);
-        while (process_events_->GetEvent() && (n_sampled < n_wanted) &&
-               (n_sampled < EVENT_LOOP_MAX)) {
+        const bool all_events = (process_num_events_ == kAutoEvent);
+        while ((all_events || n_sampled < process_num_events_) &&
+               (n_sampled < EVENT_LOOP_MAX) &&
+               process_events_->GetEvent()) {
             const uint32_t idx = static_cast<uint32_t>(process_events_->GetLastEventIndex());
-            if (idx >= process_num_events_) {
-                break;
-            }
             if (include_error_counts_) {
                 lbw_metrics_.addErrorBitCounts(process_events_->getErrorBitword());
             }

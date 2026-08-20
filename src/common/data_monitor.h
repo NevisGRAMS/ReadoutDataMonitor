@@ -110,7 +110,7 @@ private:
     void StopContinuousLbw();
     void ContinuousLbwLoop();
     bool OpenContinuousFile(const ReadoutFileCandidate& target);
-    // Stride-sample the open file from event 0, average, send one 0x4001 packet.
+    // Average events 0..n_event-1 of the open file and send one 0x4001 packet.
     bool ProcessAndSendLbFileAverage();
     bool AdvanceContinuousToNextClosedFile();
     bool TryOpenInitialContinuousFile();
@@ -182,7 +182,7 @@ private:
 
     uint32_t continuous_run_request_ = kAutoRun;
     uint32_t continuous_file_request_ = kAutoFile;
-    uint32_t continuous_stride_ = 1;
+    uint32_t continuous_n_event_ = 100;
     uint32_t continuous_period_sec_ = kMinPeriodSec;
     uint32_t continuous_next_evt_ = 0;
     uint32_t continuous_resolved_run_ = 0;
@@ -195,7 +195,6 @@ private:
     bool include_error_counts_ = true;
 
     size_t process_num_events_;
-    size_t event_stride_ = 500;
     constexpr static size_t EVENT_LOOP_MAX = 10000;
 
     LowBwTpcMonitor lbw_metrics_;
