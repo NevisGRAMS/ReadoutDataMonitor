@@ -664,7 +664,7 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
         uint32_t n_sampled = 0;
         uint32_t last_evt = 0;
         const bool all_events = (continuous_n_event_ == kAutoEvent);
-        while (process_events_->GetEvent()) {
+        while (continuous_lbw_running_.load() && process_events_->GetEvent()) {
             if (include_error_counts_) {
                 lbw_metrics_.addErrorBitCounts(process_events_->getErrorBitword());
             }
@@ -677,6 +677,11 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
             }
         }
 
+        if (!continuous_lbw_running_.load()) {
+            std::cout << "Continuous LBW aborted after " << n_sampled
+                      << " events; packet not sent" << std::endl;
+            return false;
+        }
         if (n_sampled == 0) {
             return false;
         }
@@ -768,17 +773,23 @@ std::optional<size_t> FindSlotIndex(const EventStruct& event, uint16_t slot) {
                 }
 
                 if (continuous_file_open_ && !waiting_for_file) {
-                    if (ProcessAndSendLbFileAverage()) {
+                    const bool sent = ProcessAndSendLbFileAverage();
+                    const bool aborted = !continuous_lbw_running_.load();
+                    if (sent) {
                         processed_file = true;
                         std::cout << "Continuous LBW sent run=" << continuous_resolved_run_
                                   << " file=" << continuous_resolved_file_ << std::endl;
+                    } else if (aborted) {
+                        std::cout << "Continuous LBW abandoned in-progress decode" << std::endl;
                     } else {
                         std::cerr << "Continuous LBW: no events sampled in "
                                   << continuous_open_path_ << std::endl;
                     }
 
                     ReleaseContinuousFile();
-                    if (IsFixedContinuousTarget()) {
+                    if (aborted) {
+                        waiting_for_file = true;
+                    } else if (IsFixedContinuousTarget()) {
                         waiting_for_file = true;
                         std::cout << "Continuous LBW idle (fixed run/file sent once); "
                                   << "Stop Continuous LBW to exit" << std::endl;

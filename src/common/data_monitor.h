@@ -107,10 +107,12 @@ private:
 
     void RunLbQueryOnCurrentTarget();
     void StartContinuousLbw(const std::vector<uint32_t>& args);
+    // Sets the stop flag and joins. In-progress decode abandons after the current event.
     void StopContinuousLbw();
     void ContinuousLbwLoop();
     bool OpenContinuousFile(const ReadoutFileCandidate& target);
     // Average events 0..n_event-1 of the open file and send one 0x4001 packet.
+    // Returns false if Stop aborted (no packet) or the file had no events.
     bool ProcessAndSendLbFileAverage();
     bool AdvanceContinuousToNextClosedFile();
     bool TryOpenInitialContinuousFile();
